@@ -1,0 +1,131 @@
+# =============================================================
+# .gitignore — Pan-India AQ Engine
+# =============================================================
+
+# ── Secrets & credentials ────────────────────────────────────
+.env
+config/gee_key.json
+*.pem
+*.p12
+*.key
+*credentials*.json
+*service_account*.json
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+.installed.cfg
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.eggs/
+lib/
+lib64/
+MANIFEST
+
+# ── Virtual environments ─────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+# Note: conda envs are stored globally in ~/anaconda3/envs/ — not in repo
+
+# ── Jupyter ──────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+# ^ Un-comment the line below if you DO want to track notebooks:
+# !notebooks/*.ipynb
+
+# ── ML artifacts (large binary files — use DVC or Git LFS) ──
+proxy_model/artifacts/*.joblib
+proxy_model/artifacts/*.pkl
+forecasting/checkpoints/
+forecasting/checkpoints/*.pt
+forecasting/checkpoints/*.pth
+*.onnx
+
+# ── Data files ───────────────────────────────────────────────
+data/
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Logs ─────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── OS & editor junk ─────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Testing & coverage ───────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+
+# ── MyPy & type checkers ─────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+
+# ── Distribution / packaging ─────────────────────────────────
+*.tar.gz
+*.whl
+
+# ── FastAPI / Uvicorn ────────────────────────────────────────
+.uvicorn.pid
+
+# ── Streamlit ────────────────────────────────────────────────
+.streamlit/secrets.toml
+# (keep .streamlit/config.toml tracked)
+!.streamlit/config.toml
+
+# ── Docker ───────────────────────────────────────────────────
+.dockerignore
+docker-compose.override.yml
+
+# ── Terraform / IaC ──────────────────────────────────────────
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# ── Keep these despite the above rules ───────────────────────
+!proxy_model/artifacts/.gitkeep
+!requirements.txt
+!environment.yml

@@ -1,0 +1,80 @@
+# =============================================================
+# environment.yml — Anaconda environment for Pan-India AQ Engine
+# =============================================================
+# Python version: 3.11.x (see rationale in README.md)
+#
+# CREATE:  conda env create -f environment.yml
+# ACTIVATE: conda activate aq_engine
+# UPDATE:  conda env update -f environment.yml --prune
+# REMOVE:  conda env remove -n aq_engine
+# =============================================================
+
+name: aq_engine
+
+channels:
+  - conda-forge      # preferred: more up-to-date builds than defaults
+  - defaults
+
+dependencies:
+  # ── Python ─────────────────────────────────────────────────
+  - python=3.11
+
+  # ── Core scientific stack (conda-forge builds are faster/more stable) ──
+  - numpy>=1.26,<2.0
+  - pandas>=2.1,<3.0
+  - scipy>=1.11
+
+  # ── Geospatial ──────────────────────────────────────────────
+  - geopandas>=0.14        # optional: shapefile-based India boundary check
+  - shapely>=2.0
+
+  # ── HTTP ────────────────────────────────────────────────────
+  - requests>=2.31
+  - urllib3>=2.0
+
+  # ── Database ────────────────────────────────────────────────
+  - sqlalchemy>=2.0
+  - psycopg2>=2.9          # sync PostgreSQL driver
+
+  # ── ML ──────────────────────────────────────────────────────
+  - scikit-learn>=1.4
+  - xgboost>=2.0
+  - joblib>=1.3
+
+  # ── Dev / testing ───────────────────────────────────────────
+  - pytest>=8.0
+  - pytest-asyncio>=0.23
+  - ipykernel                # so the env shows up in Jupyter
+  - black                    # formatter
+  - isort                    # import sorter
+  - flake8                   # linter
+
+  # ── Pip-only packages (not on conda-forge or need latest) ───
+  - pip
+  - pip:
+    # Google Earth Engine
+    - earthengine-api>=0.1.380
+
+    # Async PostgreSQL driver
+    - asyncpg>=0.29
+
+    # API layer
+    - fastapi>=0.110
+    - uvicorn[standard]>=0.27
+    - pydantic>=2.5
+    - httpx>=0.27            # async test client for FastAPI
+
+    # Frontend
+    - streamlit>=1.32
+    - plotly>=5.20
+
+    # PyTorch (CPU build; swap URL for CUDA if needed)
+    - torch>=2.2
+
+    # Config & logging
+    - python-dotenv>=1.0
+    - loguru>=0.7
+
+    # Utilities
+    - tenacity>=8.2          # retry decorator (used in utils)
+    - rich>=13.0             # pretty console output
