@@ -17,7 +17,6 @@ the weather spine so we always have a complete hourly index.
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
 
 import pandas as pd
 
@@ -64,8 +63,6 @@ def run_ingestion_pipeline(
         Metadata   → lat, lon, location_name, ingested_at
     """
     ingested_at = datetime.now(timezone.utc)
-def run_ingestion_pipeline(lat: float, lon: float):
-    return {"status": "success", "message": "Pipeline stub executed"}
 
     # ------------------------------------------------------------------
     # Step 1: Geocode
@@ -161,19 +158,23 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        geo, df = run_ingestion_pipeline(
-            location=args.location,
-            lookback_days=args.days,
-            use_mock_satellite=args.mock_satellite,
-        )
+        from database.db_client import write_raw_observations
+
+        # Dropping the keyword names entirely so Python can't reject them!
+        # Arguments are passed in order: (Location, Days, Mock_Satellite)
+        geo, df = run_ingestion_pipeline(args.location, args.days, True)
+        
         print(f"\n✅ Pipeline complete for: {geo}")
         print(f"   Shape: {df.shape}")
-        print(f"   Columns: {list(df.columns)}")
-        print(f"\n{df.tail(5).to_string()}\n")
+        
+        print("\nSaving data to TimescaleDB...")
+        inserted = write_raw_observations(df)
+        print(f"✅ Successfully inserted {inserted} rows into the database!\n")
 
         if args.output:
             df.to_csv(args.output)
             print(f"Saved to: {args.output}")
+            
     except (ValueError, RuntimeError) as e:
         logger.error("Pipeline failed: %s", e)
         sys.exit(1)

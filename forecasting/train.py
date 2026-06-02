@@ -1,136 +1,233 @@
 """
 forecasting/train.py
 --------------------
-Module 4 — LSTM Training Loop
+Module 4 — Trainer for the LSTM + GRU + XGBoost forecasting ensemble.
 
-Trains the AQI forecasting LSTM on historical data pulled from the
-TimescaleDB aqi_computed table. Saves the best checkpoint (by
-validation loss) to forecasting/checkpoints/lstm_aqi.pt.
+Trains (any combination of):
+  • LSTM   →  forecasting/checkpoints/lstm_aqi.pt
+  • GRU    →  forecasting/checkpoints/gru_aqi.pt
+  • XGB    →  forecasting/checkpoints/xgb_forecaster.joblib
 
-What "best checkpoint" means here:
-  We split the 168-hour sequences into 80% train / 20% validation
-  (time-ordered — no shuffling, because leaking future data into
-  training would give falsely optimistic results). We save the
-  model from the epoch with the lowest validation RMSE.
+Then runs an OOF blend search to write best weights into
+forecasting/checkpoints/ensemble_weights.json.
 
-Early stopping kicks in if validation loss doesn't improve for
-15 consecutive epochs — saves time and prevents overfitting.
-
-Usage:
+Usage
+-----
   conda activate aq_engine
+
+  # Train everything (recommended)
   python forecasting/train.py --location "Delhi"
-  python forecasting/train.py --location "Mumbai" --epochs 100
+
+  # Train just one component
+  python forecasting/train.py --location "Mumbai" --model lstm
+  python forecasting/train.py --location "Mumbai" --model gru
+  python forecasting/train.py --location "Mumbai" --model xgb
+
+Notes
+-----
+* Time-ordered 80/20 train/val split (no shuffling) so validation can't
+  see the future.
+* Early stopping at 15 stale epochs for the NN models; XGBoost uses its
+  own internal early stopping on the same val split.
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
+import joblib
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from sklearn.metrics import mean_squared_error
+from torch.utils.data import DataLoader, Subset
+from xgboost import XGBRegressor
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from database.db_client import get_lstm_input_sequence
 from exceptions import SequenceTooShortError
 from forecasting.dataset import AQISequenceDataset, prepare_sequence
-from forecasting.model import AQIForecastLSTM, save_checkpoint
+from forecasting.model import (
+    AQIForecastGRU,
+    AQIForecastLSTM,
+    CHECKPOINT_DIR,
+    save_checkpoint,
+)
 from ingestion.geocoder import geocode
 from logger import get_logger
 
 logger = get_logger(__name__)
 
-# Training hyperparameters — reasonable defaults for city-level AQI
-BATCH_SIZE      = 32
-LEARNING_RATE   = 1e-3
-WEIGHT_DECAY    = 1e-4   # L2 regularisation via AdamW
-PATIENCE        = 15     # early stopping patience (epochs)
-DEFAULT_EPOCHS  = 80
+# Shared hyperparameters
+BATCH_SIZE     = 32
+LEARNING_RATE  = 1e-3
+WEIGHT_DECAY   = 1e-4
+PATIENCE       = 15
+DEFAULT_EPOCHS = 80
+
+XGB_FORECAST_PATH = CHECKPOINT_DIR / "xgb_forecaster.joblib"
+ENS_WEIGHTS_PATH  = CHECKPOINT_DIR / "ensemble_weights.json"
+XGB_TAIL_HOURS    = 24   # how many recent hours to flatten as XGB input
 
 
-def train_one_epoch(
-    model:      AQIForecastLSTM,
-    loader:     DataLoader,
-    optimiser:  torch.optim.Optimizer,
-    criterion:  nn.Module,
-    device:     torch.device,
-) -> float:
-    """Single training epoch. Returns average loss over all batches."""
-    model.train()
-    total_loss = 0.0
+# ===========================================================================
+# Neural training helpers
+# ===========================================================================
 
-    for X_batch, y_batch in loader:
-        X_batch = X_batch.to(device)
-        y_batch = y_batch.to(device).unsqueeze(1)  # (batch,) → (batch, 1)
-
-        optimiser.zero_grad()
-        preds = model(X_batch)
-        loss  = criterion(preds, y_batch)
-        loss.backward()
-
-        # Gradient clipping — prevents exploding gradients in LSTM
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        optimiser.step()
-        total_loss += loss.item()
-
-    return total_loss / len(loader)
+def _epoch(model, loader, optim, crit, device, train: bool) -> float:
+    model.train() if train else model.eval()
+    total = 0.0
+    ctx = torch.enable_grad() if train else torch.no_grad()
+    with ctx:
+        for X, y in loader:
+            X = X.to(device)
+            y = y.to(device).unsqueeze(1)
+            pred = model(X)
+            loss = crit(pred, y)
+            if train:
+                optim.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optim.step()
+            total += loss.item()
+    return total / max(len(loader), 1)
 
 
-def validate(
-    model:     AQIForecastLSTM,
-    loader:    DataLoader,
-    criterion: nn.Module,
-    device:    torch.device,
-) -> float:
-    """Validation pass. Returns average loss, no gradient computation."""
+def _train_nn(name: str, model_cls, train_loader, val_loader, n_features,
+              scaler_params, device, epochs: int):
+    model = model_cls(n_features=n_features).to(device)
+    optim = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE,
+                              weight_decay=WEIGHT_DECAY)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optim, mode="min", patience=5, factor=0.5,
+    )
+    crit  = nn.MSELoss()
+
+    best, stale = float("inf"), 0
+    print(f"\n  Training {name} | epochs={epochs} | device={device}\n")
+    for ep in range(1, epochs + 1):
+        tr = _epoch(model, train_loader, optim, crit, device, train=True)
+        vl = _epoch(model, val_loader,   optim, crit, device, train=False)
+        sched.step(vl)
+
+        flag = ""
+        if vl < best:
+            best, stale = vl, 0
+            save_checkpoint(model, scaler_params, ep, vl)
+            flag = "  ← best"
+        else:
+            stale += 1
+
+        if ep % 5 == 0 or ep == 1:
+            print(f"  {name} {ep:3d}/{epochs} | "
+                  f"train={tr:.4f} | val={vl:.4f}{flag}")
+
+        if stale >= PATIENCE:
+            print(f"\n  Early stopping {name} at epoch {ep}.")
+            break
+
+    print(f"\n  {name} best val loss: {best:.4f}\n")
+    return best
+
+
+# ===========================================================================
+# XGBoost forecaster (tabular flatten of recent window)
+# ===========================================================================
+
+def _build_xgb_dataset(X_seq: np.ndarray, y_seq: np.ndarray, tail: int = XGB_TAIL_HOURS):
+    """
+    X_seq : (N, T, F)  sliding windows from prepare_sequence()
+    y_seq : (N,)       AQI target one hour ahead (normalised)
+
+    Returns
+    -------
+    X_tab : (N, tail * F)  last `tail` hours flattened
+    y_tab : (N,)
+    """
+    Xt = X_seq[:, -tail:, :].reshape(X_seq.shape[0], -1)
+    return Xt, y_seq
+
+
+def _train_xgb(X_seq, y_seq, n_train) -> XGBRegressor:
+    X_tab, y_tab = _build_xgb_dataset(X_seq, y_seq)
+    X_tr, y_tr = X_tab[:n_train], y_tab[:n_train]
+    X_va, y_va = X_tab[n_train:], y_tab[n_train:]
+
+    model = XGBRegressor(
+        n_estimators         = 800,
+        max_depth            = 7,
+        learning_rate        = 0.04,
+        subsample            = 0.85,
+        colsample_bytree     = 0.85,
+        reg_lambda           = 1.5,
+        reg_alpha            = 0.1,
+        objective            = "reg:squarederror",
+        tree_method          = "hist",
+        random_state         = 42,
+        n_jobs               = -1,
+        early_stopping_rounds= 40,
+    )
+    model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+
+    val_rmse = float(np.sqrt(mean_squared_error(y_va, model.predict(X_va))))
+    logger.info("XGB forecaster val RMSE (normalised): {:.4f} | best_iter={}",
+                val_rmse, model.best_iteration)
+
+    CHECKPOINT_DIR.mkdir(exist_ok=True)
+    joblib.dump(model, XGB_FORECAST_PATH)
+    print(f"  XGBoost forecaster saved → {XGB_FORECAST_PATH}\n")
+    return model
+
+
+# ===========================================================================
+# Ensemble weight search
+# ===========================================================================
+
+def _search_weights(lstm_val, gru_val, xgb_val, y_val) -> dict:
+    """Grid search 11x11x11 simplex of weights, minimise val RMSE."""
+    best, best_w = float("inf"), None
+    grid = np.linspace(0, 1, 11)
+    for a in grid:
+        for b in grid:
+            c = 1.0 - a - b
+            if c < 0 or c > 1:
+                continue
+            blend = a * lstm_val + b * gru_val + c * xgb_val
+            rmse  = float(np.sqrt(mean_squared_error(y_val, blend)))
+            if rmse < best:
+                best, best_w = rmse, {"lstm": float(a), "gru": float(b), "xgb": float(c)}
+    logger.info("Best ensemble weights: {} | val RMSE={:.4f}", best_w, best)
+    ENS_WEIGHTS_PATH.write_text(json.dumps(best_w, indent=2))
+    print(f"  Ensemble weights saved → {ENS_WEIGHTS_PATH}: {best_w}\n")
+    return best_w
+
+
+def _nn_val_predictions(model, val_loader, device) -> np.ndarray:
     model.eval()
-    total_loss = 0.0
-
+    preds = []
     with torch.no_grad():
-        for X_batch, y_batch in loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device).unsqueeze(1)
-
-            preds = model(X_batch)
-            loss  = criterion(preds, y_batch)
-            total_loss += loss.item()
-
-    return total_loss / len(loader)
+        for X, _ in val_loader:
+            preds.append(model(X.to(device)).cpu().numpy().squeeze(1))
+    return np.concatenate(preds) if preds else np.array([])
 
 
-def run_training(
-    lat: float,
-    lon: float,
-    location_name: str,
-    epochs: int = DEFAULT_EPOCHS,
-) -> None:
-    """
-    Full training run for a single location.
+# ===========================================================================
+# Driver
+# ===========================================================================
 
-    1. Pulls historical sequence from DB
-    2. Builds sliding-window dataset
-    3. Trains with early stopping
-    4. Saves best checkpoint
-    """
+def run_training(lat: float, lon: float, location_name: str,
+                 which: str = "all", epochs: int = DEFAULT_EPOCHS) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Training device: {}", device)
-    logger.info("Fetching training data for: {}", location_name)
 
-    # Pull the sequence from DB — needs Module 1 + 3 to have run first
-    df = get_lstm_input_sequence(lat, lon, lookback_hours=720)  # 30 days
-
+    df = get_lstm_input_sequence(lat, lon, lookback_hours=720)
     if df.empty:
-        logger.error(
-            "No data in DB for {}. Run the ingestion pipeline first: "
-            "python ingestion/pipeline.py '{}'",
-            location_name, location_name
-        )
+        logger.error("No data in DB for {}. Run the ingestion pipeline first.",
+                     location_name)
         return
 
-    # Build dataset
     try:
         X, y, scaler_params = prepare_sequence(df)
     except SequenceTooShortError as e:
@@ -138,110 +235,67 @@ def run_training(
         return
 
     dataset = AQISequenceDataset(X, y)
+    n_total = len(dataset)
+    n_train = int(0.8 * n_total)
 
-    # Time-ordered 80/20 split — no shuffling
-    n_total    = len(dataset)
-    n_train    = int(0.8 * n_total)
-    n_val      = n_total - n_train
-
-    # Use Subset rather than random_split to preserve time ordering
-    train_indices = list(range(n_train))
-    val_indices   = list(range(n_train, n_total))
-
-    from torch.utils.data import Subset
-    train_set = Subset(dataset, train_indices)
-    val_set   = Subset(dataset, val_indices)
+    train_set = Subset(dataset, list(range(n_train)))
+    val_set   = Subset(dataset, list(range(n_train, n_total)))
 
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=False)
     val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False)
 
-    logger.info(
-        "Dataset: {} train / {} val samples | {} features",
-        n_train, n_val, X.shape[2]
-    )
+    logger.info("Dataset: {} train / {} val | features={}",
+                n_train, n_total - n_train, X.shape[2])
 
-    # Initialise model, optimiser, loss
-    model     = AQIForecastLSTM().to(device)
-    optimiser = torch.optim.AdamW(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY
-    )
-    # ReduceLROnPlateau halves the learning rate if val loss stalls for 5 epochs
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimiser, mode="min", patience=5, factor=0.5, verbose=False
-    )
-    criterion = nn.MSELoss()   # MSE in normalised space ≈ RMSE in AQI units
+    want_lstm = which in ("all", "lstm")
+    want_gru  = which in ("all", "gru")
+    want_xgb  = which in ("all", "xgb")
 
-    # Training loop with early stopping
-    best_val_loss  = float("inf")
-    patience_count = 0
+    if want_lstm:
+        _train_nn("LSTM", AQIForecastLSTM, train_loader, val_loader,
+                  X.shape[2], scaler_params, device, epochs)
+    if want_gru:
+        _train_nn("GRU",  AQIForecastGRU,  train_loader, val_loader,
+                  X.shape[2], scaler_params, device, epochs)
+    if want_xgb:
+        _train_xgb(X, y, n_train)
 
-    print(f"\n  Training LSTM for: {location_name}")
-    print(f"  Epochs: {epochs} | Batch: {BATCH_SIZE} | Device: {device}\n")
+    # If we trained the whole stack, also pick optimal blending weights
+    if which == "all":
+        from forecasting.model import load_checkpoint
+        lstm_model, _ = load_checkpoint(device, "lstm")
+        gru_model,  _ = load_checkpoint(device, "gru")
+        xgb_model     = joblib.load(XGB_FORECAST_PATH)
 
-    for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimiser, criterion, device)
-        val_loss   = validate(model, val_loader, criterion, device)
+        y_val = y[n_train:]
+        lstm_val = _nn_val_predictions(lstm_model, val_loader, device)
+        gru_val  = _nn_val_predictions(gru_model,  val_loader, device)
+        X_tab, _ = _build_xgb_dataset(X, y)
+        xgb_val  = xgb_model.predict(X_tab[n_train:])
 
-        scheduler.step(val_loss)
-
-        # Save checkpoint if this is the best epoch so far
-        if val_loss < best_val_loss:
-            best_val_loss  = val_loss
-            patience_count = 0
-            save_checkpoint(model, scaler_params, epoch, val_loss)
-            flag = "  ← best"
-        else:
-            patience_count += 1
-            flag = ""
-
-        # Print progress every 5 epochs
-        if epoch % 5 == 0 or epoch == 1:
-            print(
-                f"  Epoch {epoch:3d}/{epochs} | "
-                f"Train loss: {train_loss:.4f} | "
-                f"Val loss: {val_loss:.4f}{flag}"
-            )
-
-        # Early stopping
-        if patience_count >= PATIENCE:
-            print(f"\n  Early stopping at epoch {epoch} (no improvement for {PATIENCE} epochs).")
-            break
-
-    print(f"\n  Best val loss: {best_val_loss:.4f}")
-    print(f"  Checkpoint saved to: forecasting/checkpoints/lstm_aqi.pt\n")
+        # Defensive — keep the shortest common length in case of tail trimming
+        m = min(len(y_val), len(lstm_val), len(gru_val), len(xgb_val))
+        _search_weights(lstm_val[:m], gru_val[:m], xgb_val[:m], y_val[:m])
 
 
-# ================================================================
-# Entry Point
-# ================================================================
+# ===========================================================================
+# CLI
+# ===========================================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train the LSTM AQI forecasting model."
+        description="Train the LSTM + GRU + XGBoost AQI forecasting ensemble."
     )
-    parser.add_argument(
-        "--location",
-        type=str,
-        required=True,
-        help='City to train on, e.g. "Delhi" or "Mumbai, Maharashtra"'
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=DEFAULT_EPOCHS,
-        help=f"Max training epochs (default: {DEFAULT_EPOCHS})."
-    )
+    parser.add_argument("--location", required=True,
+                        help='City to train on, e.g. "Delhi" or "Mumbai, Maharashtra"')
+    parser.add_argument("--model", choices=["all", "lstm", "gru", "xgb"],
+                        default="all",
+                        help="Train one component or all three (default).")
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS,
+                        help=f"Max epochs for NN models (default: {DEFAULT_EPOCHS}).")
     args = parser.parse_args()
 
-    # Geocode the location to get lat/lon for the DB query
     geo = geocode(args.location)
     logger.info("Training for: {}", geo)
-
-    run_training(
-        lat=geo.lat,
-        lon=geo.lon,
-        location_name=geo.display_name,
-        epochs=args.epochs,
-    )
+    run_training(lat=geo.lat, lon=geo.lon, location_name=geo.display_name,
+                 which=args.model, epochs=args.epochs)

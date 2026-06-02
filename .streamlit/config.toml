@@ -1,0 +1,29 @@
+# .streamlit/config.toml
+# ----------------------
+# Streamlit configuration for the Pan-India AQ Engine UI.
+# This file is tracked in Git (unlike .streamlit/secrets.toml which is gitignored).
+#
+# Docs: https://docs.streamlit.io/library/advanced-features/configuration
+
+[server]
+port = 8501
+headless = true          # prevents browser auto-open (we open it manually)
+enableCORS = false       # FastAPI handles CORS, not Streamlit
+enableXsrfProtection = false
+
+[browser]
+# Set to false so Streamlit doesn't try to gather usage statistics
+gatherUsageStats = false
+
+[theme]
+# Clean dark theme that matches the AQI gauge colour palette
+base = "dark"
+primaryColor         = "#1565c0"   # deep blue — matches the forecast line
+backgroundColor      = "#0e1117"   # near-black background
+secondaryBackgroundColor = "#1e2130"  # slightly lighter for cards/sidebars
+textColor            = "#e0e0e0"   # soft white text
+font                 = "sans serif"
+
+[runner]
+# Fixes a common Windows warning about file watching
+magicEnabled = true

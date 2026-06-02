@@ -1,27 +1,29 @@
 """
 forecasting/model.py
 --------------------
-Module 4 — LSTM Forecasting Model
+Module 4 — LSTM + GRU Forecasting Models
 
-Architecture: stacked LSTM → dropout → fully connected output
+This file defines BOTH neural sequence models used in the ensemble:
+  • AQIForecastLSTM — stacked LSTM (captures long-term dependencies)
+  • AQIForecastGRU  — stacked GRU  (lighter, often better on noisy data)
 
-Why LSTM for AQI forecasting?
-  - AQI has strong temporal dependencies (today's pollution affects tomorrow's)
-  - Weather patterns follow sequences the LSTM can learn
-  - 168-hour lookback captures weekly cycles and meteorological persistence
+Both share the same input shape and same checkpoint protocol so the
+ensemble layer (forecasting/ensemble.py) can call either interchangeably.
 
-The model predicts one step at a time. For 24-hour forecasting, we
-call it autoregressively: predict T+1, feed that prediction back in,
-predict T+2, and so on up to T+24.
+Why both?
+  LSTMs and GRUs make different mistakes on the same input. Averaging
+  their predictions (then blending with XGBoost) reduces variance and
+  almost always beats either model alone.
 
-This file also contains the inference function used by the FastAPI
-endpoint — no training code here, just the architecture + predict().
+Inference is autoregressive: predict T+1, append the prediction to the
+input window, slide the window, predict T+2, … up to T+24.
 """
 
 import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 
@@ -36,236 +38,218 @@ from utils import aqi_category
 logger = get_logger(__name__)
 
 CHECKPOINT_DIR  = Path(__file__).parent / "checkpoints"
-CHECKPOINT_PATH = CHECKPOINT_DIR / "lstm_aqi.pt"
+LSTM_CKPT_PATH  = CHECKPOINT_DIR / "lstm_aqi.pt"
+GRU_CKPT_PATH   = CHECKPOINT_DIR / "gru_aqi.pt"
 
 
-# ================================================================
-# Model Architecture
-# ================================================================
+# ===========================================================================
+# Architectures
+# ===========================================================================
 
-class AQIForecastLSTM(nn.Module):
-    """
-    Stacked LSTM for single-step AQI prediction.
-
-    Input  : (batch, seq_len, n_features) — 168 hours of features
-    Output : (batch, 1) — predicted normalised AQI at the next hour
-
-    Architecture choices:
-    - 2 LSTM layers to capture both short-term and longer-term patterns
-    - Hidden size 128 — enough capacity without overfitting on city-level data
-    - Dropout 0.2 between layers — regularisation, important since we have
-      limited real training data
-    - Single linear output head — regression, not classification
-    """
+class _RecurrentForecaster(nn.Module):
+    """Shared scaffolding for LSTM and GRU forecasters."""
 
     def __init__(
         self,
+        rnn_cls,
         n_features:  int   = N_FEATURES,
         hidden_size: int   = 128,
         n_layers:    int   = 2,
         dropout:     float = 0.2,
     ):
         super().__init__()
-
         self.hidden_size = hidden_size
         self.n_layers    = n_layers
 
-        self.lstm = nn.LSTM(
-            input_size   = n_features,
-            hidden_size  = hidden_size,
-            num_layers   = n_layers,
-            dropout      = dropout if n_layers > 1 else 0.0,
-            batch_first  = True,   # input shape: (batch, seq, features)
+        self.rnn = rnn_cls(
+            input_size  = n_features,
+            hidden_size = hidden_size,
+            num_layers  = n_layers,
+            dropout     = dropout if n_layers > 1 else 0.0,
+            batch_first = True,
         )
-
-        # Small dropout before the output layer adds a bit more regularisation
         self.dropout = nn.Dropout(dropout)
-
-        # Output: predict a single normalised AQI value
-        self.fc = nn.Linear(hidden_size, 1)
+        self.fc      = nn.Linear(hidden_size, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass.
-
-        Parameters
-        ----------
-        x : torch.Tensor, shape (batch, seq_len, n_features)
-
-        Returns
-        -------
-        torch.Tensor, shape (batch, 1)
-        """
-        # lstm_out: (batch, seq_len, hidden_size)
-        lstm_out, _ = self.lstm(x)
-
-        # We only care about the last timestep's hidden state
-        last_hidden = lstm_out[:, -1, :]    # (batch, hidden_size)
-
-        out = self.dropout(last_hidden)
-        out = self.fc(out)                  # (batch, 1)
-
-        return out
+        out, _ = self.rnn(x)          # (B, T, H)
+        last   = out[:, -1, :]        # (B, H)
+        return self.fc(self.dropout(last))   # (B, 1)
 
 
-# ================================================================
+class AQIForecastLSTM(_RecurrentForecaster):
+    """Stacked LSTM forecaster."""
+    def __init__(self, **kwargs):
+        super().__init__(nn.LSTM, **kwargs)
+        # alias so save_checkpoint can read `.input_size` regardless of cell type
+        self.lstm = self.rnn
+
+
+class AQIForecastGRU(_RecurrentForecaster):
+    """Stacked GRU forecaster — lighter than LSTM, faster to train."""
+    def __init__(self, **kwargs):
+        super().__init__(nn.GRU, **kwargs)
+        self.gru = self.rnn
+
+
+# ===========================================================================
 # Checkpoint save / load
-# ================================================================
+# ===========================================================================
+
+def _ckpt_path_for(model: nn.Module) -> Path:
+    return GRU_CKPT_PATH if isinstance(model, AQIForecastGRU) else LSTM_CKPT_PATH
+
 
 def save_checkpoint(
-    model: AQIForecastLSTM,
+    model: _RecurrentForecaster,
     scaler_params: np.ndarray,
     epoch: int,
     val_loss: float,
+    path: Path | None = None,
 ) -> None:
-    """Save model weights + scaler params so inference can run standalone."""
+    """Persist weights + scaler so inference can run standalone."""
     CHECKPOINT_DIR.mkdir(exist_ok=True)
+    target = path or _ckpt_path_for(model)
 
     torch.save({
         "epoch":         epoch,
         "val_loss":      val_loss,
         "model_state":   model.state_dict(),
-        "scaler_params": scaler_params,   # shape (2, n_features): [mean, std]
-        "n_features":    model.lstm.input_size,
+        "scaler_params": scaler_params,            # shape (2, n_features)
+        "n_features":    model.rnn.input_size,
         "hidden_size":   model.hidden_size,
         "n_layers":      model.n_layers,
-    }, CHECKPOINT_PATH)
+        "model_class":   model.__class__.__name__,
+    }, target)
 
     logger.info(
         "Checkpoint saved → {} (epoch={}, val_loss={:.4f})",
-        CHECKPOINT_PATH, epoch, val_loss
+        target, epoch, val_loss,
     )
 
 
-def load_checkpoint(device: torch.device) -> tuple[AQIForecastLSTM, np.ndarray]:
+def load_checkpoint(
+    device: torch.device,
+    model_type: str = "lstm",
+) -> tuple[_RecurrentForecaster, np.ndarray]:
     """
-    Load model + scaler from the saved checkpoint.
-
-    Returns (model, scaler_params) ready for inference.
-    Raises CheckpointNotFoundError if the file doesn't exist.
-    """
-    if not CHECKPOINT_PATH.exists():
-        raise CheckpointNotFoundError(
-            f"LSTM checkpoint not found at {CHECKPOINT_PATH}. "
-            "Run: python forecasting/train.py"
-        )
-
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
-
-    model = AQIForecastLSTM(
-        n_features  = checkpoint["n_features"],
-        hidden_size = checkpoint["hidden_size"],
-        n_layers    = checkpoint["n_layers"],
-    )
-    model.load_state_dict(checkpoint["model_state"])
-    model.to(device)
-    model.eval()
-
-    scaler_params = checkpoint["scaler_params"]
-
-    logger.info(
-        "LSTM checkpoint loaded (epoch={}, val_loss={:.4f})",
-        checkpoint["epoch"], checkpoint["val_loss"]
-    )
-
-    return model, scaler_params
-
-
-# ================================================================
-# 24-hour autoregressive inference
-# ================================================================
-
-def forecast_24h(
-    sequence_df,                     # pd.DataFrame from db_client
-    forecast_hours: int = FORECAST_HOURS,
-) -> list[dict]:
-    """
-    Generate a 24-hour AQI forecast for a location.
-
-    Uses autoregressive prediction: predict T+1, append it to the
-    input window, slide the window forward, predict T+2, and so on.
-    Weather features for future hours are held constant at their
-    last known values (persistence forecast for weather).
+    Load a trained model + its training-time scaler.
 
     Parameters
     ----------
-    sequence_df : pd.DataFrame
-        168-hour feature sequence from db_client.get_lstm_input_sequence().
-    forecast_hours : int
-        Number of hours to forecast ahead. Default 24.
+    model_type : 'lstm' | 'gru'
+    """
+    if model_type.lower() == "gru":
+        path, ctor = GRU_CKPT_PATH, AQIForecastGRU
+    else:
+        path, ctor = LSTM_CKPT_PATH, AQIForecastLSTM
 
-    Returns
-    -------
-    list[dict]
-        One dict per forecast hour:
-        {forecast_target_time, aqi_forecast, aqi_category_forecast,
-         hours_ahead}
+    if not path.exists():
+        raise CheckpointNotFoundError(
+            f"{model_type.upper()} checkpoint not found at {path}. "
+            f"Run: python forecasting/train.py --model {model_type}"
+        )
+
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+
+    model = ctor(
+        n_features  = ckpt["n_features"],
+        hidden_size = ckpt["hidden_size"],
+        n_layers    = ckpt["n_layers"],
+    )
+    model.load_state_dict(ckpt["model_state"])
+    model.to(device).eval()
+
+    logger.info(
+        "{} checkpoint loaded (epoch={}, val_loss={:.4f})",
+        model_type.upper(), ckpt["epoch"], ckpt["val_loss"],
+    )
+    return model, ckpt["scaler_params"]
+
+
+# ===========================================================================
+# 24-hour autoregressive inference (single model)
+# ===========================================================================
+
+def forecast_24h_single(
+    sequence_df: pd.DataFrame,
+    model_type: str = "lstm",
+    forecast_hours: int = FORECAST_HOURS,
+) -> list[dict]:
+    """
+    Generate a 24-hour AQI forecast using a SINGLE neural model
+    (LSTM or GRU). Use forecasting/ensemble.py for the blended forecast.
+
+    Critical fix vs. previous version
+    ---------------------------------
+    The scaler params now come from the SAVED CHECKPOINT (training-time
+    statistics), not recomputed from the inference sequence. Re-fitting
+    the scaler at inference time silently corrupts predictions whenever
+    the recent window's distribution drifts from the training set.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, scaler_params = load_checkpoint(device)
+    model, scaler_params = load_checkpoint(device, model_type=model_type)
 
-    # Import here to avoid circular dependency
-    from forecasting.dataset import prepare_sequence, LSTM_FEATURE_COLS
-
-    # Prepare the input sequence
-    X, _, _ = prepare_sequence(sequence_df)
-
-    # We'll use the last window as the seed for autoregression
-    # scaler_params from this sequence for inverse-transform
-    _, _, scaler_params = prepare_sequence(sequence_df)
     feature_mean = scaler_params[0]
     feature_std  = scaler_params[1]
+    # Guard against degenerate std (constant column at train time)
+    feature_std  = np.where(feature_std == 0, 1.0, feature_std)
 
-    # Get the last 168-hour normalised window
-    available_cols  = [c for c in LSTM_FEATURE_COLS if c in sequence_df.columns]
-    seq_values      = sequence_df[available_cols].values.astype(np.float32)
-    seq_norm        = (seq_values - feature_mean) / feature_std
-    current_window  = seq_norm[-LSTM_LOOKBACK_HOURS:].copy()  # (168, n_features)
+    # Make sure every expected feature column is present
+    df = sequence_df.copy()
+    for col in LSTM_FEATURE_COLS:
+        if col not in df.columns:
+            df[col] = 0.0
+    df = df[LSTM_FEATURE_COLS].ffill(limit=3).bfill(limit=3)
+    df = df.fillna(df.median())
 
-    # The last known timestamp in the sequence
-    last_timestamp = sequence_df.index[-1]
+    seq_values = df.values.astype(np.float32)
+    seq_norm   = (seq_values - feature_mean) / feature_std
+
+    if len(seq_norm) < LSTM_LOOKBACK_HOURS:
+        raise ValueError(
+            f"Need at least {LSTM_LOOKBACK_HOURS} hours of history, "
+            f"got {len(seq_norm)}."
+        )
+
+    current_window = seq_norm[-LSTM_LOOKBACK_HOURS:].copy()   # (168, F)
+    last_timestamp = df.index[-1] if isinstance(df.index, pd.DatetimeIndex) \
+        else sequence_df.index[-1]
 
     forecasts = []
-    model.eval()
-
     with torch.no_grad():
         for h in range(1, forecast_hours + 1):
-            # Input tensor: (1, 168, n_features)
-            x_tensor = torch.from_numpy(
-                current_window[np.newaxis, :, :]
-            ).float().to(device)
+            x = torch.from_numpy(current_window[np.newaxis]).float().to(device)
+            pred_norm = float(model(x).cpu().numpy().squeeze())
 
-            # Predict next normalised AQI
-            pred_norm = model(x_tensor).cpu().numpy().squeeze()  # scalar
-
-            # Inverse-transform to get actual AQI value
+            # Inverse-transform: column 0 is AQI
             aqi_pred = float(pred_norm * feature_std[0] + feature_mean[0])
-            aqi_pred = max(0, round(aqi_pred))   # AQI can't be negative
+            aqi_pred = max(0, round(aqi_pred))
 
             target_time = last_timestamp + pd.Timedelta(hours=h)
-
             forecasts.append({
-                "forecast_target_time":   target_time,
-                "aqi_forecast":           aqi_pred,
-                "aqi_category_forecast":  aqi_category(aqi_pred),
-                "hours_ahead":            h,
+                "forecast_target_time":  target_time,
+                "aqi_forecast":          aqi_pred,
+                "aqi_category_forecast": aqi_category(aqi_pred),
+                "hours_ahead":           h,
+                "model":                 model_type.upper(),
             })
 
-            # Slide the window forward: drop the oldest hour, append the new prediction
-            # For the predicted hour, copy weather features from the last known hour
-            # (persistence assumption — no weather forecast integration yet)
-            new_row = current_window[-1].copy()  # copy last row's weather
-            new_row[0] = pred_norm               # update AQI column with our prediction
+            # Slide window: keep weather columns as persistence, update AQI
+            new_row    = current_window[-1].copy()
+            new_row[0] = pred_norm
             current_window = np.vstack([current_window[1:], new_row])
 
     logger.info(
-        "24h forecast generated: AQI range [{} – {}]",
+        "{} 24h forecast: AQI range [{} – {}]",
+        model_type.upper(),
         min(f["aqi_forecast"] for f in forecasts),
         max(f["aqi_forecast"] for f in forecasts),
     )
-
     return forecasts
 
 
-# needed for autoregressive loop above
-import pandas as pd
+# Backwards-compat alias so old imports keep working
+def forecast_24h(sequence_df, forecast_hours: int = FORECAST_HOURS) -> list[dict]:
+    """Backwards-compatible wrapper — runs the LSTM-only forecast."""
+    return forecast_24h_single(sequence_df, "lstm", forecast_hours)

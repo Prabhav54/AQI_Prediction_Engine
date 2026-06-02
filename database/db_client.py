@@ -140,9 +140,12 @@ def write_raw_observations(df: pd.DataFrame) -> int:
                 chunksize = 500,
             )
 
-            conn.execute(text("""
-                INSERT INTO raw_observations
-                SELECT * FROM raw_observations_staging
+            # Explicitly name the columns so Postgres doesn't get confused
+            cols = ", ".join(df_out.columns)
+            
+            conn.execute(text(f"""
+                INSERT INTO raw_observations ({cols})
+                SELECT {cols} FROM raw_observations_staging
                 ON CONFLICT (timestamp, location_hash) DO NOTHING
             """))
             conn.execute(text("DROP TABLE IF EXISTS raw_observations_staging"))
@@ -346,3 +349,38 @@ def write_forecast(
 
     except Exception as exc:
         raise HypertableError(f"Failed to write forecast: {exc}") from exc
+
+
+# ================================================================
+# Read: Proxy Model Training Data
+# ================================================================
+
+def get_proxy_training_data(lat: float, lon: float, days: int = 35) -> pd.DataFrame:
+    """
+    Fetch historical raw observations for training the proxy model.
+    """
+    loc_hash = location_hash(lat, lon)
+    since    = datetime.now(timezone.utc) - timedelta(days=days)
+    engine   = get_sync_engine()
+
+    query = text("""
+        SELECT *
+        FROM raw_observations
+        WHERE location_hash = :loc_hash
+          AND timestamp >= :since
+        ORDER BY timestamp ASC
+    """)
+
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                query, conn,
+                params      = {"loc_hash": loc_hash, "since": since},
+                index_col   = "timestamp",
+                parse_dates = ["timestamp"],
+            )
+        if df.empty:
+            logger.warning("No proxy training data found for {} (last {} days).", loc_hash, days)
+        return df
+    except Exception as exc:
+        raise DatabaseError(f"Failed to fetch proxy training data: {exc}") from exc

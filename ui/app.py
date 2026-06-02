@@ -299,16 +299,14 @@ def main():
 
         if result:
             st.success(
-                f"✅ Data pull queued for **{result['resolved_name']}** "
-                f"({result['lat']:.4f}°N, {result['lon']:.4f}°E). "
+                f"✅ Data pull queued for **{result.get('location', 'your chosen city')}**."
                 "Refreshing in a moment..."
             )
             # Store resolved coords in session state so the display
             # sections below can use them
             st.session_state["lat"]           = result["lat"]
             st.session_state["lon"]           = result["lon"]
-            st.session_state["resolved_name"] = result["resolved_name"]
-
+            st.session_state["resolved_name"] = result.get("location", "Unknown Location")
             # Give the background pipeline a few seconds before displaying
             import time; time.sleep(5)
             st.rerun()

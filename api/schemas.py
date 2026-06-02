@@ -4,13 +4,16 @@ from pydantic import BaseModel
 
 # --- INGESTION SCHEMAS ---
 class IngestRequest(BaseModel):
-    lat: float
-    lon: float
+    location: str
+    lookback_days: int = 7
+    use_mock_satellite: bool = False
 
 class IngestResponse(BaseModel):
     status: str
     message: str
     location: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 
 # --- FORECAST SCHEMAS ---
 class PollutantBreakdown(BaseModel):

@@ -38,14 +38,7 @@ class IngestionError(AQEngineError):
 
 
 class GeocodingError(IngestionError):
-    """
-    Raised when a location string cannot be resolved to coordinates.
-
-    Attributes
-    ----------
-    query : str
-        The original location string that failed.
-    """
+    """Raised when a location string cannot be resolved to coordinates."""
     def __init__(self, message: str, query: str = ""):
         super().__init__(message)
         self.query = query
@@ -56,10 +49,7 @@ class GeocodingError(IngestionError):
 
 
 class LocationOutsideIndiaError(GeocodingError):
-    """
-    Raised when geocoding succeeds but the result falls outside India's
-    bounding box / boundary polygon.
-    """
+    """Resolved coordinates fall outside India's boundary."""
     def __init__(self, query: str, lat: float, lon: float):
         msg = (
             f"Resolved location for '{query}' is outside India: "
@@ -75,14 +65,7 @@ class GEEAuthError(IngestionError):
 
 
 class GEEFetchError(IngestionError):
-    """
-    Raised when a GEE ImageCollection query returns no data or errors.
-
-    Attributes
-    ----------
-    collection : str
-        GEE dataset ID that was queried.
-    """
+    """Raised when a GEE ImageCollection query returns no data or errors."""
     def __init__(self, message: str, collection: str = ""):
         super().__init__(message)
         self.collection = collection
@@ -109,15 +92,7 @@ class ProxyModelError(AQEngineError):
 
 
 class ModelNotFoundError(ProxyModelError):
-    """
-    Raised when the trained model artifact (.joblib) is not found at
-    the expected path.
-
-    Attributes
-    ----------
-    path : str
-        The artifact path that was checked.
-    """
+    """Raised when the trained model artifact (.joblib) is missing."""
     def __init__(self, path: str):
         super().__init__(
             f"Model artifact not found at '{path}'. "
@@ -127,10 +102,7 @@ class ModelNotFoundError(ProxyModelError):
 
 
 class InsufficientFeaturesError(ProxyModelError):
-    """
-    Raised when required input features (AOD, temperature, humidity) are
-    missing or entirely NaN in the inference DataFrame.
-    """
+    """Required input features (AOD, temperature, humidity) are missing or NaN."""
 
 
 # ===========================================================================
@@ -154,24 +126,14 @@ class MigrationError(DatabaseError):
 # ===========================================================================
 
 class ForecastingError(AQEngineError):
-    """Base for LSTM forecasting errors."""
+    """Base for LSTM/GRU/XGBoost forecasting errors."""
 
 
 class SequenceTooShortError(ForecastingError):
-    """
-    Raised when the available historical data is shorter than the
-    LSTM lookback window (168 hours).
-
-    Attributes
-    ----------
-    available : int
-        Number of available hourly rows.
-    required : int
-        Minimum rows required (LSTM_LOOKBACK_HOURS).
-    """
+    """Available historical data is shorter than the lookback window."""
     def __init__(self, available: int, required: int):
         super().__init__(
-            f"Insufficient history for LSTM: {available} rows available, "
+            f"Insufficient history for forecasting: {available} rows available, "
             f"{required} required. Ingest more data first."
         )
         self.available = available
@@ -179,7 +141,7 @@ class SequenceTooShortError(ForecastingError):
 
 
 class CheckpointNotFoundError(ForecastingError):
-    """Raised when the LSTM model checkpoint file is missing."""
+    """Raised when a model checkpoint file is missing."""
 
 
 # ===========================================================================
@@ -197,11 +159,7 @@ class InvalidRequestError(APIError):
 class InferenceTimeoutError(APIError):
     """Raised when an ML inference call exceeds the allowed time budget."""
 
-class DatabaseError(Exception):
-    pass
-
-class CheckpointNotFoundError(Exception):
-    pass
-
-class SequenceTooShortError(Exception):
-    pass
+# NOTE: previously this file had duplicate stubs (DatabaseError, CheckpointNotFoundError,
+# SequenceTooShortError) appended at the bottom inheriting from plain Exception with
+# no __init__. Those silently shadowed the real classes and broke any code that called
+# `SequenceTooShortError(available=..., required=...)`. They have been removed.
