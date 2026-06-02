@@ -162,7 +162,7 @@ if __name__ == "__main__":
 
     try:
         geo, df = run_ingestion_pipeline(
-            location_query=args.location,
+            location=args.location,
             lookback_days=args.days,
             use_mock_satellite=args.mock_satellite,
         )
