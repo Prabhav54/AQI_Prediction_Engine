@@ -64,6 +64,8 @@ def run_ingestion_pipeline(
         Metadata   → lat, lon, location_name, ingested_at
     """
     ingested_at = datetime.now(timezone.utc)
+def run_ingestion_pipeline(lat: float, lon: float):
+    return {"status": "success", "message": "Pipeline stub executed"}
 
     # ------------------------------------------------------------------
     # Step 1: Geocode

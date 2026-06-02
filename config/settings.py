@@ -28,7 +28,8 @@ DB_URL_SYNC: str = os.getenv(
 # Google Earth Engine
 # ---------------------------------------------------------------------------
 GEE_SERVICE_ACCOUNT: str = os.getenv("GEE_SERVICE_ACCOUNT", "")
-GEE_KEY_FILE: str = os.getenv("GEE_KEY_FILE", "config/gee_key.json")
+GEE_KEY_FILE: str        = os.getenv("GEE_KEY_FILE", "config/gee_key.json")
+EE_PROJECT_ID: str       = os.getenv("EE_PROJECT_ID", "")   # required since GEE API v0.1.370+
 
 # ---------------------------------------------------------------------------
 # Open-Meteo (no API key required for the free tier)

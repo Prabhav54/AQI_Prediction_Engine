@@ -18,7 +18,7 @@ from typing import Optional
 import pandas as pd
 import numpy as np
 
-from config.settings import GEE_KEY_FILE, GEE_SERVICE_ACCOUNT, GEE_BANDS, LOOKBACK_DAYS
+from config.settings import GEE_KEY_FILE, GEE_SERVICE_ACCOUNT, EE_PROJECT_ID, GEE_BANDS, LOOKBACK_DAYS
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +28,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 def _init_gee() -> None:
     """
-    Initialize GEE. Tries service account first; falls back to cached
-    user credentials (useful for interactive dev with `ee.Authenticate()`).
+    Initialize GEE. Tries service account first (Mode B); falls back to
+    cached OAuth credentials (Mode A — after running ee.Authenticate()).
+
+    EE_PROJECT_ID is passed to ee.Initialize() in both modes — required
+    since earthengine-api v0.1.370+.
     """
     try:
         import ee
@@ -41,13 +44,22 @@ def _init_gee() -> None:
     if ee.data._credentials:   # already initialised in this process
         return
 
+    if not EE_PROJECT_ID:
+        raise GEEAuthError(
+            "EE_PROJECT_ID is not set. Add your GCP project ID to .env:\n"
+            "  EE_PROJECT_ID=your-gcp-project-id\n"
+            "Find it at: https://console.cloud.google.com"
+        )
+
     if GEE_SERVICE_ACCOUNT and GEE_KEY_FILE:
-        logger.info("Authenticating GEE via service account: %s", GEE_SERVICE_ACCOUNT)
+        # Mode B — service account JSON key
+        logger.info("Authenticating GEE via service account: {}", GEE_SERVICE_ACCOUNT)
         credentials = ee.ServiceAccountCredentials(GEE_SERVICE_ACCOUNT, GEE_KEY_FILE)
-        ee.Initialize(credentials)
+        ee.Initialize(credentials, project=EE_PROJECT_ID)
     else:
-        logger.info("Authenticating GEE via cached user credentials.")
-        ee.Initialize()
+        # Mode A — cached OAuth credentials (from ee.Authenticate())
+        logger.info("Authenticating GEE via cached OAuth credentials (project={}).", EE_PROJECT_ID)
+        ee.Initialize(project=EE_PROJECT_ID)
 
 
 # ---------------------------------------------------------------------------

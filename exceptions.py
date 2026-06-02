@@ -196,3 +196,12 @@ class InvalidRequestError(APIError):
 
 class InferenceTimeoutError(APIError):
     """Raised when an ML inference call exceeds the allowed time budget."""
+
+class DatabaseError(Exception):
+    pass
+
+class CheckpointNotFoundError(Exception):
+    pass
+
+class SequenceTooShortError(Exception):
+    pass

@@ -65,6 +65,8 @@ def _is_within_india(lat: float, lon: float) -> bool:
         INDIA_BBOX["lat_min"] <= lat <= INDIA_BBOX["lat_max"]
         and INDIA_BBOX["lon_min"] <= lon <= INDIA_BBOX["lon_max"]
     )
+def geocode(lat: float, lon: float) -> str:
+    return f"Location at {lat}, {lon}"
 
 
 def geocode(location_query: str, country_code: str = "IN") -> GeoLocation:
