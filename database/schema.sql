@@ -229,3 +229,111 @@ SELECT add_retention_policy(
 -- SELECT * FROM timescaledb_information.hypertables;
 -- SELECT * FROM timescaledb_information.jobs;
 -- \dt  -- should show 3 tables
+
+-- STEP 1: Calculate the 24-hour rolling averages and 8-hour maximums
+CREATE OR REPLACE VIEW v_rolling_averages AS
+SELECT 
+    timestamp,
+    location_hash,
+    location_name,
+    lat,
+    lon,
+    AVG(pm25_proxy) OVER(PARTITION BY location_hash ORDER BY timestamp RANGE BETWEEN INTERVAL '24 hours' PRECEDING AND CURRENT ROW) as pm25_24h_avg,
+    AVG(pm10_proxy) OVER(PARTITION BY location_hash ORDER BY timestamp RANGE BETWEEN INTERVAL '24 hours' PRECEDING AND CURRENT ROW) as pm10_24h_avg,
+    AVG(no2) OVER(PARTITION BY location_hash ORDER BY timestamp RANGE BETWEEN INTERVAL '24 hours' PRECEDING AND CURRENT ROW) as no2_24h_avg,
+    AVG(so2) OVER(PARTITION BY location_hash ORDER BY timestamp RANGE BETWEEN INTERVAL '24 hours' PRECEDING AND CURRENT ROW) as so2_24h_avg,
+    MAX(co) OVER(PARTITION BY location_hash ORDER BY timestamp RANGE BETWEEN INTERVAL '8 hours' PRECEDING AND CURRENT ROW) as co_8h_max,
+    MAX(o3) OVER(PARTITION BY location_hash ORDER BY timestamp RANGE BETWEEN INTERVAL '8 hours' PRECEDING AND CURRENT ROW) as o3_8h_max
+FROM raw_observations;
+
+-- STEP 2: Calculate the Indian CPCB Sub-Indices for each pollutant
+CREATE OR REPLACE VIEW v_sub_indices AS
+SELECT 
+    *,
+    -- PM2.5 Sub-Index
+    CASE 
+        WHEN pm25_24h_avg <= 30 THEN (pm25_24h_avg * 50 / 30)
+        WHEN pm25_24h_avg <= 60 THEN 50 + ((pm25_24h_avg - 30) * 50 / 30)
+        WHEN pm25_24h_avg <= 90 THEN 100 + ((pm25_24h_avg - 60) * 100 / 30)
+        WHEN pm25_24h_avg <= 120 THEN 200 + ((pm25_24h_avg - 90) * 100 / 30)
+        WHEN pm25_24h_avg <= 250 THEN 300 + ((pm25_24h_avg - 120) * 100 / 130)
+        ELSE 400 + ((pm25_24h_avg - 250) * 100 / 100)
+    END as sub_index_pm25,
+    
+    -- PM10 Sub-Index
+    CASE 
+        WHEN pm10_24h_avg <= 50 THEN (pm10_24h_avg * 50 / 50)
+        WHEN pm10_24h_avg <= 100 THEN 50 + ((pm10_24h_avg - 50) * 50 / 50)
+        WHEN pm10_24h_avg <= 250 THEN 100 + ((pm10_24h_avg - 100) * 100 / 150)
+        WHEN pm10_24h_avg <= 350 THEN 200 + ((pm10_24h_avg - 250) * 100 / 100)
+        WHEN pm10_24h_avg <= 430 THEN 300 + ((pm10_24h_avg - 350) * 100 / 80)
+        ELSE 400 + ((pm10_24h_avg - 430) * 100 / 100)
+    END as sub_index_pm10,
+
+    -- NO2 Sub-Index
+    CASE 
+        WHEN no2_24h_avg <= 40 THEN (no2_24h_avg * 50 / 40)
+        WHEN no2_24h_avg <= 80 THEN 50 + ((no2_24h_avg - 40) * 50 / 40)
+        WHEN no2_24h_avg <= 180 THEN 100 + ((no2_24h_avg - 80) * 100 / 100)
+        WHEN no2_24h_avg <= 280 THEN 200 + ((no2_24h_avg - 180) * 100 / 100)
+        WHEN no2_24h_avg <= 400 THEN 300 + ((no2_24h_avg - 280) * 100 / 120)
+        ELSE 400 + ((no2_24h_avg - 400) * 100 / 100)
+    END as sub_index_no2,
+
+    -- SO2 Sub-Index
+    CASE 
+        WHEN so2_24h_avg <= 40 THEN (so2_24h_avg * 50 / 40)
+        WHEN so2_24h_avg <= 80 THEN 50 + ((so2_24h_avg - 40) * 50 / 40)
+        WHEN so2_24h_avg <= 380 THEN 100 + ((so2_24h_avg - 80) * 100 / 300)
+        WHEN so2_24h_avg <= 800 THEN 200 + ((so2_24h_avg - 380) * 100 / 420)
+        ELSE 300 + ((so2_24h_avg - 800) * 100 / 800)
+    END as sub_index_so2,
+
+    -- CO Sub-Index
+    CASE 
+        WHEN co_8h_max <= 1 THEN (co_8h_max * 50 / 1)
+        WHEN co_8h_max <= 2 THEN 50 + ((co_8h_max - 1) * 50 / 1)
+        WHEN co_8h_max <= 10 THEN 100 + ((co_8h_max - 2) * 100 / 8)
+        WHEN co_8h_max <= 17 THEN 200 + ((co_8h_max - 10) * 100 / 7)
+        WHEN co_8h_max <= 34 THEN 300 + ((co_8h_max - 17) * 100 / 17)
+        ELSE 400 + ((co_8h_max - 34) * 100 / 100)
+    END as sub_index_co,
+
+    -- O3 Sub-Index
+    CASE 
+        WHEN o3_8h_max <= 50 THEN (o3_8h_max * 50 / 50)
+        WHEN o3_8h_max <= 100 THEN 50 + ((o3_8h_max - 50) * 50 / 50)
+        WHEN o3_8h_max <= 168 THEN 100 + ((o3_8h_max - 100) * 100 / 68)
+        WHEN o3_8h_max <= 208 THEN 200 + ((o3_8h_max - 168) * 100 / 40)
+        WHEN o3_8h_max <= 748 THEN 300 + ((o3_8h_max - 208) * 100 / 540)
+        ELSE 400 + ((o3_8h_max - 748) * 100 / 100)
+    END as sub_index_o3
+FROM v_rolling_averages;
+
+-- STEP 3: Combine sub-indices to extract the overall AQI, prominent pollutant, and category
+CREATE OR REPLACE VIEW v_aqi_final AS
+SELECT 
+    *,
+    -- Overall AQI is the maximum of individual sub-indices
+    GREATEST(sub_index_pm25, sub_index_pm10, sub_index_no2, sub_index_so2, sub_index_co, sub_index_o3) as aqi,
+    
+    -- Determine prominent pollutant
+    CASE GREATEST(sub_index_pm25, sub_index_pm10, sub_index_no2, sub_index_so2, sub_index_co, sub_index_o3)
+        WHEN sub_index_pm25 THEN 'PM2.5'
+        WHEN sub_index_pm10 THEN 'PM10'
+        WHEN sub_index_no2 THEN 'NO2'
+        WHEN sub_index_so2 THEN 'SO2'
+        WHEN sub_index_co THEN 'CO'
+        WHEN sub_index_o3 THEN 'O3'
+    END as prominent_pollutant,
+    
+    -- Assign regulatory category
+    CASE 
+        WHEN GREATEST(sub_index_pm25, sub_index_pm10, sub_index_no2, sub_index_so2, sub_index_co, sub_index_o3) <= 50 THEN 'Good'
+        WHEN GREATEST(sub_index_pm25, sub_index_pm10, sub_index_no2, sub_index_so2, sub_index_co, sub_index_o3) <= 100 THEN 'Satisfactory'
+        WHEN GREATEST(sub_index_pm25, sub_index_pm10, sub_index_no2, sub_index_so2, sub_index_co, sub_index_o3) <= 200 THEN 'Moderate'
+        WHEN GREATEST(sub_index_pm25, sub_index_pm10, sub_index_no2, sub_index_so2, sub_index_co, sub_index_o3) <= 300 THEN 'Poor'
+        WHEN GREATEST(sub_index_pm25, sub_index_pm10, sub_index_no2, sub_index_so2, sub_index_co, sub_index_o3) <= 400 THEN 'Very Poor'
+        ELSE 'Severe'
+    END as aqi_category
+FROM v_sub_indices;

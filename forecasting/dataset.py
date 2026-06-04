@@ -111,7 +111,7 @@ def prepare_sequence(
     # Forward-fill short gaps, then fill remaining NaNs with column median
     # (NaNs in LSTM inputs cause NaN gradients and silent training failure)
     df = df.ffill(limit=3).bfill(limit=3)
-    df = df.fillna(df.median())
+    df = df.fillna(df.median(numeric_only=True)).fillna(0)
 
     values = df.values.astype(np.float32)
 

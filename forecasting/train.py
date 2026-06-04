@@ -35,6 +35,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from sklearn.model_selection import GridSearchCV
 
 import joblib
 import numpy as np
@@ -155,30 +156,48 @@ def _train_xgb(X_seq, y_seq, n_train) -> XGBRegressor:
     X_tr, y_tr = X_tab[:n_train], y_tab[:n_train]
     X_va, y_va = X_tab[n_train:], y_tab[n_train:]
 
-    model = XGBRegressor(
-        n_estimators         = 800,
-        max_depth            = 7,
-        learning_rate        = 0.04,
-        subsample            = 0.85,
-        colsample_bytree     = 0.85,
-        reg_lambda           = 1.5,
-        reg_alpha            = 0.1,
-        objective            = "reg:squarederror",
-        tree_method          = "hist",
-        random_state         = 42,
-        n_jobs               = -1,
-        early_stopping_rounds= 40,
-    )
-    model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+    logger.info("Starting XGBoost Grid Search to find optimal parameters...")
 
-    val_rmse = float(np.sqrt(mean_squared_error(y_va, model.predict(X_va))))
-    logger.info("XGB forecaster val RMSE (normalised): {:.4f} | best_iter={}",
-                val_rmse, model.best_iteration)
+    # The Grid: The model will test every single combination of these values
+    param_grid = {
+        'max_depth': [3, 5, 7],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'n_estimators': [300, 500, 800]
+    }
+
+    # Base model
+    base_model = XGBRegressor(
+        objective="reg:squarederror",
+        tree_method="hist",
+        random_state=42,
+        n_jobs=-1
+    )
+
+    # Automated Scikit-learn search with 3-fold Cross Validation
+    grid_search = GridSearchCV(
+        estimator=base_model,
+        param_grid=param_grid,
+        scoring='neg_root_mean_squared_error',
+        cv=3,
+        verbose=1
+    )
+
+    # Run the search on the training data
+    grid_search.fit(X_tr, y_tr)
+
+    # Extract the absolute best model it found
+    best_model = grid_search.best_estimator_
+    logger.info(f"Optimal XGBoost parameters found: {grid_search.best_params_}")
+
+    # Final validation check
+    val_rmse = float(np.sqrt(mean_squared_error(y_va, best_model.predict(X_va))))
+    logger.info("Tuned XGB forecaster val RMSE (normalised): {:.4f}", val_rmse)
 
     CHECKPOINT_DIR.mkdir(exist_ok=True)
-    joblib.dump(model, XGB_FORECAST_PATH)
-    print(f"  XGBoost forecaster saved → {XGB_FORECAST_PATH}\n")
-    return model
+    joblib.dump(best_model, XGB_FORECAST_PATH)
+    print(f"  Tuned XGBoost forecaster saved → {XGB_FORECAST_PATH}\n")
+    
+    return best_model
 
 
 # ===========================================================================
