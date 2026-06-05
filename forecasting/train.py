@@ -1,41 +1,23 @@
 """
 forecasting/train.py
 --------------------
-Module 4 — Trainer for the LSTM + GRU + XGBoost forecasting ensemble.
+Module 4 — Trainer for the LSTM/Transformer + GRU + LightGBM ensemble.
 
 Trains (any combination of):
-  • LSTM   →  forecasting/checkpoints/lstm_aqi.pt
-  • GRU    →  forecasting/checkpoints/gru_aqi.pt
-  • XGB    →  forecasting/checkpoints/xgb_forecaster.joblib
+  • LSTM/Transformer -> forecasting/checkpoints/lstm_aqi.pt
+  • GRU              -> forecasting/checkpoints/gru_aqi.pt
+  • LightGBM         -> forecasting/checkpoints/xgb_forecaster.joblib (Kept naming for API compatibility)
 
 Then runs an OOF blend search to write best weights into
 forecasting/checkpoints/ensemble_weights.json.
-
-Usage
------
-  conda activate aq_engine
-
-  # Train everything (recommended)
-  python forecasting/train.py --location "Delhi"
-
-  # Train just one component
-  python forecasting/train.py --location "Mumbai" --model lstm
-  python forecasting/train.py --location "Mumbai" --model gru
-  python forecasting/train.py --location "Mumbai" --model xgb
-
-Notes
------
-* Time-ordered 80/20 train/val split (no shuffling) so validation can't
-  see the future.
-* Early stopping at 15 stale epochs for the NN models; XGBoost uses its
-  own internal early stopping on the same val split.
 """
 
 import argparse
 import json
 import sys
 from pathlib import Path
-from sklearn.model_selection import GridSearchCV
+import torch
+import torch.nn as nn
 
 import joblib
 import numpy as np
@@ -43,7 +25,10 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import mean_squared_error
 from torch.utils.data import DataLoader, Subset
-from xgboost import XGBRegressor
+
+# --- PHASE 2 UPGRADE: LightGBM ---
+import lightgbm as lgb
+from lightgbm import LGBMRegressor
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -56,6 +41,15 @@ from forecasting.model import (
     CHECKPOINT_DIR,
     save_checkpoint,
 )
+
+# --- PHASE 3 SAFE UPGRADE ---
+# This safely checks if you have added the Transformer to model.py yet.
+try:
+    from forecasting.model import AQIForecastTransformer
+    TRANSFORMER_AVAILABLE = True
+except ImportError:
+    TRANSFORMER_AVAILABLE = False
+
 from ingestion.geocoder import geocode
 from logger import get_logger
 
@@ -68,9 +62,10 @@ WEIGHT_DECAY   = 1e-4
 PATIENCE       = 15
 DEFAULT_EPOCHS = 80
 
+# Keep legacy names so the FastAPI backend doesn't crash
 XGB_FORECAST_PATH = CHECKPOINT_DIR / "xgb_forecaster.joblib"
 ENS_WEIGHTS_PATH  = CHECKPOINT_DIR / "ensemble_weights.json"
-XGB_TAIL_HOURS    = 24   # how many recent hours to flatten as XGB input
+XGB_TAIL_HOURS    = 24
 
 
 # ===========================================================================
@@ -117,13 +112,12 @@ def _train_nn(name: str, model_cls, train_loader, val_loader, n_features,
         if vl < best:
             best, stale = vl, 0
             save_checkpoint(model, scaler_params, ep, vl)
-            flag = "  ← best"
+            flag = "  <- best"
         else:
             stale += 1
 
         if ep % 5 == 0 or ep == 1:
-            print(f"  {name} {ep:3d}/{epochs} | "
-                  f"train={tr:.4f} | val={vl:.4f}{flag}")
+            print(f"  {name} {ep:3d}/{epochs} | train={tr:.4f} | val={vl:.4f}{flag}")
 
         if stale >= PATIENCE:
             print(f"\n  Early stopping {name} at epoch {ep}.")
@@ -134,70 +128,43 @@ def _train_nn(name: str, model_cls, train_loader, val_loader, n_features,
 
 
 # ===========================================================================
-# XGBoost forecaster (tabular flatten of recent window)
+# LightGBM forecaster (tabular flatten of recent window)
 # ===========================================================================
 
 def _build_xgb_dataset(X_seq: np.ndarray, y_seq: np.ndarray, tail: int = XGB_TAIL_HOURS):
-    """
-    X_seq : (N, T, F)  sliding windows from prepare_sequence()
-    y_seq : (N,)       AQI target one hour ahead (normalised)
-
-    Returns
-    -------
-    X_tab : (N, tail * F)  last `tail` hours flattened
-    y_tab : (N,)
-    """
     Xt = X_seq[:, -tail:, :].reshape(X_seq.shape[0], -1)
     return Xt, y_seq
 
 
-def _train_xgb(X_seq, y_seq, n_train) -> XGBRegressor:
+def _train_lgb(X_seq, y_seq, n_train):
     X_tab, y_tab = _build_xgb_dataset(X_seq, y_seq)
     X_tr, y_tr = X_tab[:n_train], y_tab[:n_train]
     X_va, y_va = X_tab[n_train:], y_tab[n_train:]
 
-    logger.info("Starting XGBoost Grid Search to find optimal parameters...")
-
-    # The Grid: The model will test every single combination of these values
-    param_grid = {
-        'max_depth': [3, 5, 7],
-        'learning_rate': [0.01, 0.05, 0.1],
-        'n_estimators': [300, 500, 800]
-    }
-
-    # Base model
-    base_model = XGBRegressor(
-        objective="reg:squarederror",
-        tree_method="hist",
+    # LightGBM handles tabular time-series features better and faster
+    model = LGBMRegressor(
+        n_estimators=600,
+        learning_rate=0.03,
+        num_leaves=31,
+        subsample=0.8,
+        colsample_bytree=0.8,
         random_state=42,
         n_jobs=-1
     )
-
-    # Automated Scikit-learn search with 3-fold Cross Validation
-    grid_search = GridSearchCV(
-        estimator=base_model,
-        param_grid=param_grid,
-        scoring='neg_root_mean_squared_error',
-        cv=3,
-        verbose=1
+    
+    model.fit(
+        X_tr, y_tr, 
+        eval_set=[(X_va, y_va)], 
+        callbacks=[lgb.early_stopping(stopping_rounds=40, verbose=False)]
     )
 
-    # Run the search on the training data
-    grid_search.fit(X_tr, y_tr)
-
-    # Extract the absolute best model it found
-    best_model = grid_search.best_estimator_
-    logger.info(f"Optimal XGBoost parameters found: {grid_search.best_params_}")
-
-    # Final validation check
-    val_rmse = float(np.sqrt(mean_squared_error(y_va, best_model.predict(X_va))))
-    logger.info("Tuned XGB forecaster val RMSE (normalised): {:.4f}", val_rmse)
+    val_rmse = float(np.sqrt(mean_squared_error(y_va, model.predict(X_va))))
+    logger.info("LightGBM forecaster val RMSE (normalised): {:.4f}", val_rmse)
 
     CHECKPOINT_DIR.mkdir(exist_ok=True)
-    joblib.dump(best_model, XGB_FORECAST_PATH)
-    print(f"  Tuned XGBoost forecaster saved → {XGB_FORECAST_PATH}\n")
-    
-    return best_model
+    joblib.dump(model, XGB_FORECAST_PATH)
+    print(f"  LightGBM forecaster saved -> {XGB_FORECAST_PATH}\n")
+    return model
 
 
 # ===========================================================================
@@ -205,7 +172,6 @@ def _train_xgb(X_seq, y_seq, n_train) -> XGBRegressor:
 # ===========================================================================
 
 def _search_weights(lstm_val, gru_val, xgb_val, y_val) -> dict:
-    """Grid search 11x11x11 simplex of weights, minimise val RMSE."""
     best, best_w = float("inf"), None
     grid = np.linspace(0, 1, 11)
     for a in grid:
@@ -219,7 +185,7 @@ def _search_weights(lstm_val, gru_val, xgb_val, y_val) -> dict:
                 best, best_w = rmse, {"lstm": float(a), "gru": float(b), "xgb": float(c)}
     logger.info("Best ensemble weights: {} | val RMSE={:.4f}", best_w, best)
     ENS_WEIGHTS_PATH.write_text(json.dumps(best_w, indent=2))
-    print(f"  Ensemble weights saved → {ENS_WEIGHTS_PATH}: {best_w}\n")
+    print(f"  Ensemble weights saved -> {ENS_WEIGHTS_PATH}: {best_w}\n")
     return best_w
 
 
@@ -271,50 +237,76 @@ def run_training(lat: float, lon: float, location_name: str,
     want_xgb  = which in ("all", "xgb")
 
     if want_lstm:
-        _train_nn("LSTM", AQIForecastLSTM, train_loader, val_loader,
-                  X.shape[2], scaler_params, device, epochs)
+        if TRANSFORMER_AVAILABLE:
+            logger.info("Phase 3 Detected: Using state-of-the-art PyTorch Transformer")
+            # We keep the name "LSTM" so the checkpoint saves correctly for the API
+            _train_nn("LSTM", AQIForecastTransformer, train_loader, val_loader,
+                      X.shape[2], scaler_params, device, epochs)
+        else:
+            logger.info("Using standard LSTM. (Add AQIForecastTransformer to model.py to upgrade!)")
+            _train_nn("LSTM", AQIForecastLSTM, train_loader, val_loader,
+                      X.shape[2], scaler_params, device, epochs)
+            
     if want_gru:
         _train_nn("GRU",  AQIForecastGRU,  train_loader, val_loader,
                   X.shape[2], scaler_params, device, epochs)
+        
     if want_xgb:
-        _train_xgb(X, y, n_train)
+        _train_lgb(X, y, n_train)
 
-    # If we trained the whole stack, also pick optimal blending weights
     if which == "all":
         from forecasting.model import load_checkpoint
         lstm_model, _ = load_checkpoint(device, "lstm")
         gru_model,  _ = load_checkpoint(device, "gru")
-        xgb_model     = joblib.load(XGB_FORECAST_PATH)
+        lgb_model     = joblib.load(XGB_FORECAST_PATH)
 
         y_val = y[n_train:]
         lstm_val = _nn_val_predictions(lstm_model, val_loader, device)
         gru_val  = _nn_val_predictions(gru_model,  val_loader, device)
         X_tab, _ = _build_xgb_dataset(X, y)
-        xgb_val  = xgb_model.predict(X_tab[n_train:])
+        lgb_val  = lgb_model.predict(X_tab[n_train:])
 
-        # Defensive — keep the shortest common length in case of tail trimming
-        m = min(len(y_val), len(lstm_val), len(gru_val), len(xgb_val))
-        _search_weights(lstm_val[:m], gru_val[:m], xgb_val[:m], y_val[:m])
+        m = min(len(y_val), len(lstm_val), len(gru_val), len(lgb_val))
+        _search_weights(lstm_val[:m], gru_val[:m], lgb_val[:m], y_val[:m])
 
 
-# ===========================================================================
-# CLI
-# ===========================================================================
+class AQIForecastTransformer(nn.Module):
+    def __init__(self, n_features, d_model=64, n_heads=4, num_layers=2, dropout=0.1):
+        super().__init__()
+        
+        # 1. Expand features
+        self.input_linear = nn.Linear(n_features, d_model)
+        
+        # 2. Time Position Awareness (Crucial for predicting rush hour)
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 168, d_model)) 
+        
+        # 3. The Attention Brain
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=n_heads, 
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # 4. Final output layer
+        self.output_linear = nn.Linear(d_model, 1)
+
+    def forward(self, x):
+        x = self.input_linear(x) 
+        x = x + self.pos_encoder[:, :x.size(1), :] 
+        x = self.transformer(x)
+        out = self.output_linear(x[:, -1, :]) 
+        return out
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Train the LSTM + GRU + XGBoost AQI forecasting ensemble."
-    )
-    parser.add_argument("--location", required=True,
-                        help='City to train on, e.g. "Delhi" or "Mumbai, Maharashtra"')
-    parser.add_argument("--model", choices=["all", "lstm", "gru", "xgb"],
-                        default="all",
-                        help="Train one component or all three (default).")
-    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS,
-                        help=f"Max epochs for NN models (default: {DEFAULT_EPOCHS}).")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--location", required=True)
+    parser.add_argument("--model", choices=["all", "lstm", "gru", "xgb"], default="all")
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     args = parser.parse_args()
 
     geo = geocode(args.location)
-    logger.info("Training for: {}", geo)
     run_training(lat=geo.lat, lon=geo.lon, location_name=geo.display_name,
                  which=args.model, epochs=args.epochs)

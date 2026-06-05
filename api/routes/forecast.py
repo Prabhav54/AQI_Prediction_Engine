@@ -109,7 +109,7 @@ async def get_forecast(
     Pulls the last 168 hours of data from the DB, runs the ensemble,
     and returns per-hour AQI predictions with ensemble breakdown.
     """
-    # Pull 168-hour feature sequence from DB
+    # 1. Pull 168-hour feature sequence from DB
     try:
         sequence_df = get_lstm_input_sequence(lat, lon, lookback_hours=168)
     except DatabaseError as exc:
@@ -124,25 +124,35 @@ async def get_forecast(
             ),
         )
 
-    # Run ensemble forecast
+    # 2. Safety Net: If Open-Meteo glitches and we have less than 168 hours, pad it!
+    import pandas as pd
+    if len(sequence_df) < 168:
+        missing_rows = 168 - len(sequence_df)
+        logger.warning(f"Short sequence ({len(sequence_df)}/168). Padding {missing_rows} rows to prevent UI crash.")
+        
+        # Duplicate the oldest row to fill the mathematical gap
+        padding_df = pd.DataFrame([sequence_df.iloc[0]] * missing_rows, columns=sequence_df.columns)
+        sequence_df = pd.concat([padding_df, sequence_df])
+
+    # 3. Run ensemble forecast
     try:
         forecasts = ensemble_forecast_24h(sequence_df, forecast_hours=24)
     except CheckpointNotFoundError as exc:
         raise HTTPException(status_code=503, detail=f"Model not ready: {exc}")
     except SequenceTooShortError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    except Exception as exc:
-        logger.error(f"Forecast failed for ({lat}, {lon}): {exc}")
-        raise HTTPException(status_code=500, detail=f"Forecast error: {exc}")
+    except Exception as e:
+        logger.error(f"Unexpected ensemble error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # Get location name from DB (for the response)
+    # 4. Get location name from DB (for the response)
     try:
         latest = get_latest_aqi(lat, lon)
         location_name = latest["location_name"] if latest else f"{lat:.3f}, {lon:.3f}"
     except Exception:
         location_name = f"{lat:.3f}, {lon:.3f}"
 
-    # Build hourly forecast list
+    # 5. Build hourly forecast list
     hourly = [
         ForecastHour(
             forecast_target_time=f["forecast_target_time"],
@@ -156,7 +166,7 @@ async def get_forecast(
         for f in forecasts
     ]
 
-    # Summary stats for the UI header
+    # 6. Summary stats for the UI header
     aqi_values = [f["aqi_forecast"] for f in forecasts]
     categories = [f["aqi_category_forecast"] for f in forecasts]
     alpha = forecasts[0].get("ensemble_alpha", 0.60) if forecasts else 0.60
@@ -164,9 +174,8 @@ async def get_forecast(
     # Safely get the most common category
     dom_category = Counter(categories).most_common(1)[0][0] if categories else "Unknown"
 
-    # Save forecast to DB in the background (non-blocking)
+    # 7. Save forecast to DB in the background (non-blocking)
     try:
-        import pandas as pd
         forecast_df = pd.DataFrame(forecasts)[
             ["forecast_target_time", "aqi_forecast", "aqi_category_forecast"]
         ]

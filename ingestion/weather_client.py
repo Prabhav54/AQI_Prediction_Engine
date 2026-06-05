@@ -3,6 +3,7 @@ ingestion/weather_client.py
 ---------------------------
 Upgraded Module 1C — Unified Weather & Air Quality fetch via Open-Meteo.
 Bypasses satellite dependencies completely to get real PM2.5/PM10 ground truth.
+Includes Exponential Backoff to survive Open-Meteo 502/SSLError network drops.
 """
 
 import logging
@@ -12,9 +13,11 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import urllib3
+
+# Network resilience imports
+from tenacity import retry, stop_after_attempt, wait_exponential
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-
 
 from config.settings import LOOKBACK_DAYS
 
@@ -25,32 +28,34 @@ AQ_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
 def _build_session() -> requests.Session:
     session = requests.Session()
+    # Requests' internal retry for fast failures
     retry = Retry(
         total=4, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504]
     )
     session.mount("https://", HTTPAdapter(max_retries=retry))
     return session
 
+
+# Tenacity Retry: If it fails, wait 2s, then 4s, up to 5 attempts.
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=10))
 def _fetch_open_meteo(session: requests.Session, url: str, params: dict) -> pd.DataFrame:
-    try:
-        resp = session.get(url, params=params, timeout=15, verify=False)
-        resp.raise_for_status()
-        hourly = resp.json().get("hourly", {})
-        if not hourly or "time" not in hourly:
-            return pd.DataFrame()
-            
-        df = pd.DataFrame(hourly)
-        df["time"] = pd.to_datetime(df["time"], utc=True)
-        return df.set_index("time").sort_index()
-    except Exception as exc:
-        logger.warning(f"Failed to fetch {url}: {exc}")
+    # We removed the try/except so Tenacity can "see" the error and retry
+    resp = session.get(url, params=params, timeout=15, verify=False)
+    resp.raise_for_status()  # This throws an error on 502, triggering the retry!
+    
+    hourly = resp.json().get("hourly", {})
+    if not hourly or "time" not in hourly:
         return pd.DataFrame()
+        
+    df = pd.DataFrame(hourly)
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    return df.set_index("time").sort_index()
+
 
 def fetch_weather_and_aq(lat: float, lon: float, lookback_days: int = LOOKBACK_DAYS) -> pd.DataFrame:
     session = _build_session()
     
     # We only fetch exactly what the UI asks for (default 7 days).
-    # No more downloading 365 days of data for a simple dashboard search!
     params_wx = {
         "latitude": lat,
         "longitude": lon,
@@ -71,11 +76,15 @@ def fetch_weather_and_aq(lat: float, lon: float, lookback_days: int = LOOKBACK_D
 
     logger.info(f"Fetching real Weather + AQ data for ({lat:.4f}, {lon:.4f}) over {lookback_days} days...")
     
-    wx_df = _fetch_open_meteo(session, WEATHER_URL, params_wx)
-    aq_df = _fetch_open_meteo(session, AQ_URL, params_aq)
+    try:
+        wx_df = _fetch_open_meteo(session, WEATHER_URL, params_wx)
+        aq_df = _fetch_open_meteo(session, AQ_URL, params_aq)
+    except Exception as e:
+        logger.error(f"Open-Meteo fetch failed completely after all retries: {e}")
+        raise RuntimeError("Failed to retrieve sufficient data from Open-Meteo APIs.")
 
     if wx_df.empty or aq_df.empty:
-        raise RuntimeError("Failed to retrieve sufficient data from Open-Meteo APIs.")
+        raise RuntimeError("Open-Meteo returned empty data.")
 
     # Merge them seamlessly on the time index
     df = pd.concat([wx_df, aq_df], axis=1)
@@ -88,8 +97,8 @@ def fetch_weather_and_aq(lat: float, lon: float, lookback_days: int = LOOKBACK_D
         "precipitation": "precip_mm",
         "surface_pressure": "pressure_hpa",
         "boundary_layer_height": "boundary_layer_m",
-        "pm2_5": "pm25_proxy",   # <-- ADDED _proxy HERE
-        "pm10": "pm10_proxy",    # <-- ADDED _proxy HERE
+        "pm2_5": "pm25_proxy",
+        "pm10": "pm10_proxy",
         "carbon_monoxide": "co",
         "nitrogen_dioxide": "no2",
         "sulphur_dioxide": "so2",
@@ -102,6 +111,7 @@ def fetch_weather_and_aq(lat: float, lon: float, lookback_days: int = LOOKBACK_D
     if "wind_speed_ms" in df.columns:
         df["wind_speed_ms"] = df["wind_speed_ms"] / 3.6
 
+    # Convert CO from micrograms to milligrams for CPCB math
     if "co" in df.columns:
         df["co"] = df["co"] / 1000.0    
         

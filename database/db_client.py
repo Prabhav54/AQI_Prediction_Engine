@@ -297,6 +297,16 @@ def get_lstm_input_sequence(
             )
         else:
             logger.info("LSTM sequence: {} rows for {}", len(df), loc_hash)
+            
+        if not df.empty:
+            # 1. Cyclic Time Features (Morning vs Night)
+            df['hour_of_day'] = df.index.hour
+            df['day_of_week'] = df.index.dayofweek
+            df['is_weekend']  = df.index.dayofweek.isin([5, 6]).astype(int)
+            
+            # 2. Trend Features (Is temperature dropping rapidly?)
+            df['temp_change_6h'] = df['temp_c'].diff(6).fillna(0)
+            df['pm25_change_3h'] = df['pm25_24h_avg'].diff(3).fillna(0)
         return df
 
     except Exception as exc:
