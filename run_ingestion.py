@@ -7,6 +7,7 @@ Run this script automatically every hour using Windows Task Scheduler or Cron.
 
 import sys
 import time
+import hashlib
 from pathlib import Path
 
 # Add project root to path so we can import internal modules
@@ -64,12 +65,16 @@ def main():
                 failed += 1
                 continue
                 
-            # 2. Run the ingestion, proxy model, and AQI computation pipeline
-            _run_pipeline_task(city, geo.lat, geo.lon)
+            # 2. Generate the unique database ID (loc_hash) securely inline
+            # This creates a unique 8-character ID based on the exact coordinates
+            loc_hash = hashlib.md5(f"{geo.lat:.4f},{geo.lon:.4f}".encode()).hexdigest()[:8]
+                
+            # 3. Run the ingestion, proxy model, and AQI computation pipeline
+            _run_pipeline_task(city, geo.lat, geo.lon, loc_hash)
             successful += 1
             
-            # Rate Limiting: Sleep for 1 second between cities to avoid Open-Meteo bans
-            time.sleep(1)
+            # Rate Limiting: Sleep for 3 seconds between cities to avoid Geocoder bans
+            time.sleep(3)
             
         except Exception as e:
             logger.error(f"Automated pipeline failed for {city}: {e}")
