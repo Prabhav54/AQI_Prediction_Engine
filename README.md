@@ -51,7 +51,7 @@ AQI_Prediction_Engine/
 2. **Time-Series Database (TimescaleDB):** Data is stored in time-partitioned hypertables. Materialized views automatically compute CPCB-compliant rolling averages in the background.
 3. **Machine Learning API (FastAPI):** Exposes REST endpoints to trigger the ETL, load the latest `.joblib` and `.pt` model weights, and serve the 24-hour predictions.
 4. **Frontend (Streamlit):** Queries the FastAPI backend to render real-time gauges, pollutant breakdowns, and forecasting trendlines.
-'''
+```
 ---
 ## 🛠️ Technology Stack
 
