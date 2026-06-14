@@ -25,7 +25,28 @@ This engine replaces slow satellite imagery processing with a high-speed, ground
 ---
 
 ## 🏗️ System Architecture
-
+```text
+AQI_Prediction_Engine/
+├── .github/workflows/
+│   └── ingest.yml              # GitHub Actions cron job for hourly cloud automation
+├── api/
+│   ├── routes/                 # FastAPI endpoints (e.g., forecast.py, ingest.py)
+│   └── main.py                 # FastAPI application instance and server config
+├── config/
+│   └── settings.py             # Global constants, DB URIs, and configuration
+├── database/
+│   └── db_client.py            # TimescaleDB connection and advanced SQL window functions
+├── forecasting/
+│   ├── train.py                # Ensemble optimization, backtesting, and training loop
+│   └── weights/                # Serialized PyTorch (.pt) and LightGBM (.joblib) models
+├── ingestion/
+│   ├── geocoder.py             # Coordinate resolution
+│   └── weather_client.py       # Open-Meteo API wrapper with exponential backoff (tenacity)
+├── app.py                      # Streamlit real-time interactive dashboard
+├── run_ingestion.py            # Main automation script orchestrating the 50-city ETL pipeline
+├── auto_ingest.bat             # Windows Task Scheduler batch executable (for local cron)
+├── requirements.txt            # Python dependencies
+└── README.md
 1. **Ingestion Worker (Cron):** An automated Python script runs hourly, geocoding 50 Indian cities, calculating secure MD5 location hashes, and pulling ground-truth CAMS-calibrated data from Open-Meteo.
 2. **Time-Series Database (TimescaleDB):** Data is stored in time-partitioned hypertables. Materialized views automatically compute CPCB-compliant rolling averages in the background.
 3. **Machine Learning API (FastAPI):** Exposes REST endpoints to trigger the ETL, load the latest `.joblib` and `.pt` model weights, and serve the 24-hour predictions.
