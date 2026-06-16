@@ -40,6 +40,8 @@ MANIFEST
 venv/
 ENV/
 env/
+env
+.env
 env.bak/
 venv.bak/
 # Note: conda envs are stored globally in ~/anaconda3/envs/ — not in repo
@@ -128,5 +130,4 @@ docker-compose.override.yml
 # ── Keep these despite the above rules ───────────────────────
 !proxy_model/artifacts/.gitkeep
 !requirements.txt
-.env
 !environment.yml
