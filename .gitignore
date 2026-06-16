@@ -128,4 +128,5 @@ docker-compose.override.yml
 # ── Keep these despite the above rules ───────────────────────
 !proxy_model/artifacts/.gitkeep
 !requirements.txt
+.env
 !environment.yml
