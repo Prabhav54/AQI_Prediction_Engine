@@ -40,6 +40,8 @@ MANIFEST
 venv/
 ENV/
 env/
+env
+.env
 env.bak/
 venv.bak/
 # Note: conda envs are stored globally in ~/anaconda3/envs/ — not in repo
