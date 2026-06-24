@@ -44,3 +44,10 @@ httpx>=0.27              # async test client for FastAPI
 
 
 lightgbm
+
+
+geopandas 
+shapely 
+requests 
+urllib3 
+tenacity

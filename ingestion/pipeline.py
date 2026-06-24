@@ -1,68 +1,35 @@
-"""
-ingestion/pipeline.py
----------------------
-Upgraded Module 1 Orchestrator
-Bypasses Google Earth Engine and pulls unified Weather + Real AQI directly from Open-Meteo.
-"""
-
+# ingestion/pipeline.py
 import logging
 from datetime import datetime, timezone
 import pandas as pd
 
-from ingestion.geocoder import GeoLocation, geocode
 from ingestion.weather_client import fetch_weather_and_aq
 from config.settings import LOOKBACK_DAYS
 
 logger = logging.getLogger(__name__)
 
-def run_ingestion_pipeline(
-    location_query: str,
-    lookback_days: int = LOOKBACK_DAYS,
-    use_mock_satellite: bool = False, # Kept so the API doesn't crash, but ignored!
-) -> tuple[GeoLocation, pd.DataFrame]:
-    
+def run_spatial_grid_pipeline(grid_row: pd.Series, lookback_days: int = LOOKBACK_DAYS) -> pd.DataFrame:
+    """
+    Executes a clean data-pull sequence for an individual coordinate tracking node.
+    Bypasses text geocoders entirely to enable seamless batch tasks.
+    """
     ingested_at = datetime.now(timezone.utc)
+    lat = float(grid_row['lat'])
+    lon = float(grid_row['lon'])
+    loc_hash = grid_row['loc_hash']
+    loc_name = grid_row['location_name']
 
-    logger.info("=== Module 1: Ingestion Pipeline START ===")
-    geo = geocode(location_query)
-    logger.info(f"Resolved: {geo}")
+    logger.info(f"Processing structural grid feed for node: {loc_hash} at ({lat}, {lon})")
+    
+    # Target API endpoint directly via raw metrics
+    merged = fetch_weather_and_aq(lat, lon, lookback_days)
 
-    # Step 2 & 3 Combined: Fetch both weather and REAL ground-truth AQ in one shot
-    merged = fetch_weather_and_aq(geo.lat, geo.lon, lookback_days)
-
-    # Attach metadata columns
-    merged["lat"]           = geo.lat
-    merged["lon"]           = geo.lon
-    merged["location_name"] = geo.display_name
+    # Attach spatial metadata columns
+    merged["lat"]           = lat
+    merged["lon"]           = lon
+    merged["location_name"] = loc_name
+    merged["location_hash"] = loc_hash
     merged["ingested_at"]   = ingested_at
     merged.index.name = "timestamp"
 
-    logger.info(f"=== Module 1 COMPLETE | rows: {len(merged)} ===")
-    return geo, merged
-
-
-if __name__ == "__main__":
-    import argparse
-    import sys
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
-
-    parser = argparse.ArgumentParser(description="Run Module 1 ingestion pipeline.")
-    parser.add_argument("location", help='Location string, e.g. "Goa"')
-    parser.add_argument("--days", type=int, default=7, help="Lookback window in days (default: 7).")
-    args = parser.parse_args()
-
-    try:
-        from database.db_client import write_raw_observations
-        
-        # Now passing exactly the positional arguments needed!
-        geo, df = run_ingestion_pipeline(args.location, args.days)
-        
-        print(f"\n✅ Pipeline complete for: {geo}")
-        print("\nSaving data to TimescaleDB...")
-        inserted = write_raw_observations(df)
-        print(f"✅ Successfully inserted {inserted} rows into the database!\n")
-            
-    except Exception as e:
-        logger.error(f"Pipeline failed: {e}")
-        sys.exit(1)
+    return merged

@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:15-3.3
+    container_name: aqi_spatial_db
+    environment:
+      POSTGRES_USER: aqi_admin
+      POSTGRES_PASSWORD: aqi_password
+      POSTGRES_DB: aqi_pan_india
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

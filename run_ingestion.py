@@ -1,86 +1,36 @@
-"""
-run_ingestion.py
-----------------
-Automated Cron script to fetch weather and compute AQI for key Indian cities.
-Run this script automatically every hour using Windows Task Scheduler or Cron.
-"""
+# run_ingestion.py (upgraded)
+import asyncio
+import aiohttp
+from ingestion.grid_generator import generate_india_grid
 
-import sys
-import time
-import hashlib
-from pathlib import Path
+BATCH_SIZE = 50       # concurrent API calls
+RATE_LIMIT_SLEEP = 1  # seconds between batches
 
-# Add project root to path so we can import internal modules
-_root = Path(__file__).resolve().parent
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
+async def fetch_city_async(session, lat: float, lon: float, loc_hash: str):
+    """Async wrapper around Open-Meteo fetch."""
+    try:
+        # Open-Meteo supports async natively — no geocoding needed for grid
+        from ingestion.weather_client import fetch_weather_and_aq
+        df = await asyncio.to_thread(fetch_weather_and_aq, lat, lon, lookback_days=1)
+        df["lat"] = lat
+        df["lon"] = lon
+        df["location_name"] = f"{lat:.2f}N,{lon:.2f}E"
+        return df
+    except Exception as e:
+        return None
 
-from ingestion.geocoder import geocode
-from api.routes.ingest import _run_pipeline_task
-from logger import get_logger
-
-logger = get_logger(__name__)
-
-# 50 Cities representing diverse climates across India for robust model training
-TARGET_CITIES = [
-    # --- Industrial & Metro (High Pollution Baseline) ---
-    "Delhi", "Noida, Uttar Pradesh", "Gurugram", "Faridabad", "Ghaziabad",
-    "Mumbai", "Kolkata", "Chennai", "Bengaluru", "Hyderabad",
-    "Ahmedabad", "Pune", "Kanpur", "Lucknow", "Patna",
-
-    # --- Coastal (High Humidity, Ocean Breezes) ---
-    "Kochi, Kerala", "Thiruvananthapuram", "Visakhapatnam", "Puri, Odisha",
-    "Goa", "Mangaluru", "Surat", "Port Blair, Andaman",
-
-    # --- Desert & Arid (High Dust, Extreme Heat) ---
-    "Jaipur", "Jodhpur", "Bikaner", "Jaisalmer", "Rajkot", 
-    "Bhuj", "Gwalior",
-
-    # --- Himalayan & High Altitude (Cold, Thin Air, Low Baseline PM) ---
-    "Srinagar", "Shimla", "Manali", "Leh", "Dehradun", 
-    "Gangtok", "Darjeeling", "Shillong", "Tawang",
-
-    # --- Central & Eastern Inland (Moderate/Varied, Forested) ---
-    "Bhopal", "Indore", "Nagpur", "Raipur", "Ranchi", 
-    "Jamshedpur", "Guwahati", "Agartala", "Aizawl", 
-
-    # --- Your Base Operations ---
-    "Rourkela"
-]
-
-def main():
-    logger.info("=== STARTING AUTOMATED HOURLY INGESTION ===")
-    logger.info(f"Targeting {len(TARGET_CITIES)} cities across India.")
+async def ingest_all_grid_points():
+    grid = generate_india_grid(resolution_deg=0.5)
     
-    successful = 0
-    failed = 0
-
-    for city in TARGET_CITIES:
-        logger.info(f"Processing: {city}")
-        try:
-            # 1. Get exact coordinates
-            geo = geocode(city)
-            if not geo:
-                logger.error(f"Could not geocode {city}. Skipping.")
-                failed += 1
-                continue
-                
-            # 2. Generate the unique database ID (loc_hash) securely inline
-            # This creates a unique 8-character ID based on the exact coordinates
-            loc_hash = hashlib.md5(f"{geo.lat:.4f},{geo.lon:.4f}".encode()).hexdigest()[:8]
-                
-            # 3. Run the ingestion, proxy model, and AQI computation pipeline
-            _run_pipeline_task(city, geo.lat, geo.lon, loc_hash)
-            successful += 1
-            
-            # Rate Limiting: Sleep for 3 seconds between cities to avoid Geocoder bans
-            time.sleep(3)
-            
-        except Exception as e:
-            logger.error(f"Automated pipeline failed for {city}: {e}")
-            failed += 1
-            
-    logger.info(f"=== HOURLY INGESTION COMPLETE | Success: {successful} | Failed: {failed} ===")
-
-if __name__ == "__main__":
-    main()
+    results = []
+    for i in range(0, len(grid), BATCH_SIZE):
+        batch = grid.iloc[i:i+BATCH_SIZE]
+        tasks = [
+            fetch_city_async(None, row.lat, row.lon, row.loc_hash)
+            for _, row in batch.iterrows()
+        ]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        results.extend([r for r in batch_results if r is not None])
+        await asyncio.sleep(RATE_LIMIT_SLEEP)
+    
+    return results

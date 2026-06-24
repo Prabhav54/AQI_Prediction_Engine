@@ -1,159 +1,122 @@
 """
 forecasting/dataset.py
 ----------------------
-Module 4 — LSTM Dataset Builder
-
-Takes the 168-hour feature sequence from the database and converts
-it into (input_sequence, target) pairs that PyTorch can train on.
-
-The core idea is a sliding window:
-  - Input X : last 168 hours of AQI + weather features (the "look-back")
-  - Target y : the AQI value at the next hour (what we're predicting)
-
-For a 7-day sequence this gives us one training sample per hour.
-During inference we take the most recent 168-hour window and predict
-T+1 through T+24 autoregressively (feed each prediction back as input).
-
-Why 168 hours?
-  - 7 days captures a full weekly cycle (weekday vs weekend patterns)
-  - Captures monsoon vs dry day-to-day variation
-  - Matches CPCB's own rolling window convention
+Upgraded Spatially-Aware Dataset Loader for Pan-India Grid.
+Extracts timeseries vectors from PostGIS and injects normalized coordinates.
 """
 
-import sys
-from pathlib import Path
-
-import numpy as np
+import logging
 import pandas as pd
-import torch
-from torch.utils.data import Dataset
+import numpy as np
+from datetime import datetime, timedelta, timezone
+from database.db_client import get_sync_engine
+from sqlalchemy import text
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+logger = logging.getLogger(__name__)
 
-from config.settings import FORECAST_HOURS, LSTM_LOOKBACK_HOURS
-from exceptions import SequenceTooShortError
-from logger import get_logger
-
-logger = get_logger(__name__)
-
-# Features fed into the LSTM at each timestep
-# AQI is first so we can easily split it from weather features
+# Global feature checklist matching ensemble model expectations
 LSTM_FEATURE_COLS = [
-    "aqi",              # the primary target variable (also an input)
-    "pm25_24h_avg",     # rolling average from DB — already smoothed
-    "pm10_24h_avg",
-    "no2_24h_avg",
-    "so2_24h_avg",
-    "co_8h_max",
-    "o3_8h_max",
-    "temp_c",
-    "humidity_pct",
-    "wind_speed_ms",
-    "precip_mm",
-    "pressure_hpa",
-    "boundary_layer_m",
+    'aqi', 'pm25_24h_avg', 'pm10_24h_avg', 'no2_24h_avg', 'so2_24h_avg', 
+    'co_8h_max', 'o3_8h_max', 'temp_c', 'humidity_pct', 'wind_speed_ms',
+    'precip_mm', 'pressure_hpa', 'boundary_layer_m', 
+    'hour_of_day', 'day_of_week', 'is_weekend', 'temp_change_6h', 'pm25_change_3h',
+    'lat_norm', 'lon_norm'
 ]
 
 N_FEATURES = len(LSTM_FEATURE_COLS)
 
-
-def prepare_sequence(
-    df: pd.DataFrame,
-    lookback: int = LSTM_LOOKBACK_HOURS,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def fetch_global_training_data(lookback_days: int = 30) -> pd.DataFrame:
     """
-    Clean, normalise, and structure the DataFrame into arrays
-    ready for PyTorch training.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Output of db_client.get_lstm_input_sequence() — hourly rows
-        with aqi + weather columns.
-    lookback : int
-        Input window size (hours). Default: 168.
-
-    Returns
-    -------
-    X : np.ndarray, shape (n_samples, lookback, n_features)
-        Input sequences — each row is a 168-hour window.
-    y : np.ndarray, shape (n_samples,)
-        Target AQI values — one hour ahead of each window.
-    scaler_params : np.ndarray, shape (2, n_features)
-        [mean, std] used for normalisation — saved alongside the model
-        so inference can apply the same scaling.
-
-    Raises
-    ------
-    SequenceTooShortError
-        If the DataFrame has fewer rows than lookback + 1.
+    Pulls historical tracking vectors from all active grid nodes simultaneously.
+    Joins rolling target metrics with weather parameters.
     """
-    if len(df) < lookback + 1:
-        raise SequenceTooShortError(
-            available=len(df),
-            required=lookback + 1
-        )
+    engine = get_sync_engine()
+    since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    
+    query = text("""
+        SELECT 
+            a.timestamp,
+            a.location_hash,
+            a.lat,
+            a.lon,
+            a.aqi, 
+            a.pm25_24h_avg, 
+            a.pm10_24h_avg,
+            a.no2_24h_avg, 
+            a.so2_24h_avg, 
+            a.co_8h_max, 
+            a.o3_8h_max,
+            r.temp_c, 
+            r.humidity_pct, 
+            r.wind_speed_ms,
+            r.precip_mm, 
+            r.pressure_hpa, 
+            r.boundary_layer_m
+        FROM aqi_computed a
+        LEFT JOIN raw_observations r
+            ON  a.timestamp     = r.timestamp
+            AND a.location_hash = r.location_hash
+        WHERE a.timestamp >= :since
+        ORDER BY a.location_hash, a.timestamp ASC
+    """)
+    
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={"since": since})
+        logger.info(f"Successfully extracted {len(df)} row sequences for global optimization training.")
+        return df
+    except Exception as exc:
+        logger.error(f"Failed to extract global training data matrix: {exc}")
+        return pd.DataFrame()
 
-    # Only keep columns we actually want
-    available = [c for c in LSTM_FEATURE_COLS if c in df.columns]
-    missing   = [c for c in LSTM_FEATURE_COLS if c not in df.columns]
-
-    if missing:
-        logger.warning(
-            "LSTM features not found in sequence data: {} — filling with 0.",
-            missing
-        )
-        for col in missing:
-            df[col] = 0.0
-
-    df = df[LSTM_FEATURE_COLS].copy()
-
-    # Forward-fill short gaps, then fill remaining NaNs with column median
-    # (NaNs in LSTM inputs cause NaN gradients and silent training failure)
-    df = df.ffill(limit=3).bfill(limit=3)
-    df = df.fillna(df.median(numeric_only=True)).fillna(0)
-
-    values = df.values.astype(np.float32)
-
-    # Normalise: (x - mean) / std  — per feature, computed on this sequence
-    # We save these params so the same scaling applies at inference time
-    feature_mean = values.mean(axis=0)
-    feature_std  = values.std(axis=0)
-    feature_std[feature_std == 0] = 1.0  # avoid division by zero for constant cols
-
-    values_norm  = (values - feature_mean) / feature_std
-    scaler_params = np.stack([feature_mean, feature_std])  # shape: (2, n_features)
-
-    # Build sliding windows
-    X_list, y_list = [], []
-
-    for i in range(len(values_norm) - lookback):
-        X_list.append(values_norm[i : i + lookback])    # window of 168 hours
-        y_list.append(values_norm[i + lookback, 0])     # AQI at hour 169 (normalised)
-
-    X = np.stack(X_list)  # (n_samples, lookback, n_features)
-    y = np.array(y_list)  # (n_samples,)
-
-    logger.info(
-        "Prepared LSTM dataset: X={}, y={}, features={}",
-        X.shape, y.shape, N_FEATURES
-    )
-
-    return X, y, scaler_params
-
-
-class AQISequenceDataset(Dataset):
+def engineer_spatial_tensors(df: pd.DataFrame) -> pd.DataFrame:
     """
-    PyTorch Dataset wrapper around the prepared sequence arrays.
-    Passed directly to a DataLoader for batched training.
+    Applies cyclic temporal extensions and normalizes geographic spatial vectors
+    so a single global model can differentiate between microclimates in India.
     """
+    if df.empty:
+        return df
+        
+    df = df.copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df = df.set_index('timestamp').sort_index()
+    
+    # 1. Core Time Feature Engineering
+    df['hour_of_day'] = df.index.hour
+    df['day_of_week'] = df.index.dayofweek
+    df['is_weekend']  = df.index.dayofweek.isin([5, 6]).astype(int)
+    
+    # 2. Dynamic Trend Momentum Indicators
+    df['temp_change_6h'] = df.groupby('location_hash')['temp_c'].diff(6).fillna(0)
+    df['pm25_change_3h'] = df.groupby('location_hash')['pm25_24h_avg'].diff(3).fillna(0)
+    
+    # 3. CRUCIAL: Spatial Coordinate Bounding Normalization (India Landmass)
+    # Scales absolute degrees uniformly into relative [0, 1] relative feature coordinates
+    df['lat_norm'] = (df['lat'] - 6.5) / (37.5 - 6.5)
+    df['lon_norm'] = (df['lon'] - 68.5) / (97.5 - 68.5)
+    
+    return df
 
-    def __init__(self, X: np.ndarray, y: np.ndarray):
-        self.X = torch.from_numpy(X).float()  # (n_samples, lookback, n_features)
-        self.y = torch.from_numpy(y).float()  # (n_samples,)
-
-    def __len__(self) -> int:
-        return len(self.X)
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.X[idx], self.y[idx]
+def prepare_lstm_sequences(df: pd.DataFrame, sequence_length: int = 168) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Chunks the unified regional dataframe into sequential sliding windows for LSTM input matrices.
+    """
+    df_engineered = engineer_spatial_tensors(df)
+    if df_engineered.empty:
+        return np.array([]), np.array([])
+        
+    X, y = [], []
+    
+    # Build history sequence windows independently per location node hash code block
+    for _, group in df_engineered.groupby('location_hash'):
+        if len(group) < sequence_length + 24: # Require enough data points for 24h targets
+            continue
+            
+        data = group[LSTM_FEATURE_COLS].values
+        target = group['aqi'].values
+        
+        for i in range(len(data) - sequence_length - 24 + 1):
+            X.append(data[i : i + sequence_length])
+            y.append(target[i + sequence_length : i + sequence_length + 24])
+            
+    return np.array(X), np.array(y)
