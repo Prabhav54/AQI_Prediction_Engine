@@ -1,312 +1,360 @@
 """
 forecasting/train.py
 --------------------
-Module 4 — Trainer for the LSTM/Transformer + GRU + LightGBM ensemble.
+Module 4 — Trainer for the global LSTM + GRU + LightGBM ensemble.
 
-Trains (any combination of):
-  • LSTM/Transformer -> forecasting/checkpoints/lstm_aqi.pt
-  • GRU              -> forecasting/checkpoints/gru_aqi.pt
-  • LightGBM         -> forecasting/checkpoints/xgb_forecaster.joblib (Kept naming for API compatibility)
+One model generation is trained across every node at once:
+  • LSTM      -> checkpoints/lstm.pt
+  • GRU       -> checkpoints/gru.pt
+  • LightGBM  -> checkpoints/lgbm.joblib   (one booster per pollutant, horizon as a feature)
 
-Then runs an OOF blend search to write best weights into
-forecasting/checkpoints/ensemble_weights.json.
+Then, on held-out data:
+  1. Per-pollutant blend weights are searched on the validation split
+     (ensemble_weights.json).
+  2. Validation residual quantiles give calibrated 80% intervals.
+  3. Everything is scored on a later test split vs persistence / seasonal
+     baselines and written to model_card.json.
+  4. With --promote-if-better the new generation is trained into a
+     candidate directory and only replaces the deployed champion if it
+     beats it on the *same* test window (champion/challenger gate).
+
+Usage
+-----
+  python forecasting/train.py --source parquet --data data/history.parquet
+  python forecasting/train.py --source db --days 120 --promote-if-better
 """
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-import torch
-import torch.nn as nn
 
 import joblib
+import lightgbm as lgb
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.metrics import mean_squared_error
-from torch.utils.data import DataLoader, Subset
-
-# --- PHASE 2 UPGRADE: LightGBM ---
-import lightgbm as lgb
-from lightgbm import LGBMRegressor
+from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from database.db_client import get_lstm_input_sequence
-from exceptions import SequenceTooShortError
-from forecasting.dataset import AQISequenceDataset, prepare_sequence
+from config.settings import POLLUTANTS
+from forecasting.dataset import (
+    HORIZON,
+    AQISequenceDataset,
+    build_store,
+    chronological_splits,
+    fit_spec,
+    lgbm_feature_names,
+    lgbm_features,
+    normalise_store,
+    sample_index,
+    true_deltas,
+)
+from forecasting.ensemble import blend, load_ensemble_weights, load_members, predict_members
+from forecasting.evaluation import residual_quantiles, score
 from forecasting.model import (
+    CHECKPOINT_DIR,
     AQIForecastGRU,
     AQIForecastLSTM,
-    CHECKPOINT_DIR,
+    artifact_paths,
+    load_spec,
     save_checkpoint,
 )
-
-# --- PHASE 3 SAFE UPGRADE ---
-# This safely checks if you have added the Transformer to model.py yet.
-try:
-    from forecasting.model import AQIForecastTransformer
-    TRANSFORMER_AVAILABLE = True
-except ImportError:
-    TRANSFORMER_AVAILABLE = False
-
-from ingestion.geocoder import geocode
 from logger import get_logger
 
 logger = get_logger(__name__)
 
 # Shared hyperparameters
-BATCH_SIZE     = 32
-LEARNING_RATE  = 1e-3
-WEIGHT_DECAY   = 1e-4
-PATIENCE       = 15
-DEFAULT_EPOCHS = 80
-
-# Keep legacy names so the FastAPI backend doesn't crash
-XGB_FORECAST_PATH = CHECKPOINT_DIR / "xgb_forecaster.joblib"
-ENS_WEIGHTS_PATH  = CHECKPOINT_DIR / "ensemble_weights.json"
-XGB_TAIL_HOURS    = 24
+BATCH_SIZE = 256
+LEARNING_RATE = 2e-3
+WEIGHT_DECAY = 1e-4
+PATIENCE = 3
+DEFAULT_EPOCHS = 12
+CANDIDATE_DIR = CHECKPOINT_DIR / "_candidate"
+PROMOTION_TOLERANCE = 1.02   # candidate may be at most 2% worse (noise) and still promote
 
 
 # ===========================================================================
-# Neural training helpers
+# Data
+# ===========================================================================
+
+def load_frame(source: str, data: str, days: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (nodes, long hourly frame) from the backfill parquet or the database."""
+    if source == "parquet":
+        frame = pd.read_parquet(data)
+        nodes = frame[["location_hash", "lat", "lon"]].drop_duplicates("location_hash")
+    else:
+        from database.db_client import load_nodes, load_observations
+
+        nodes = load_nodes()
+        frame = load_observations(days)
+        # Proxy-filled PM is a model output, not a target we want to learn
+        gap = frame["pm_gap_filled"].fillna(False).astype(bool)
+        frame.loc[gap, ["pm25", "pm10"]] = np.nan
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    logger.info("Loaded {} rows for {} nodes ({} → {})", len(frame), frame["location_hash"].nunique(),
+                frame["timestamp"].min(), frame["timestamp"].max())
+    return nodes, frame
+
+
+def _subsample(index: np.ndarray, n: int | None, seed: int = 0) -> np.ndarray:
+    if n is None or len(index) <= n:
+        return index
+    rng = np.random.default_rng(seed)
+    return index[np.sort(rng.choice(len(index), n, replace=False))]
+
+
+# ===========================================================================
+# Neural members
 # ===========================================================================
 
 def _epoch(model, loader, optim, crit, device, train: bool) -> float:
     model.train() if train else model.eval()
-    total = 0.0
+    total, n = 0.0, 0
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
-        for X, y in loader:
-            X = X.to(device)
-            y = y.to(device).unsqueeze(1)
-            pred = model(X)
-            loss = crit(pred, y)
+        for past, fut, y in loader:
+            past, fut, y = past.to(device), fut.to(device), y.to(device)
+            loss = crit(model(past, fut), y)
             if train:
                 optim.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optim.step()
-            total += loss.item()
-    return total / max(len(loader), 1)
+            total += loss.item() * len(y)
+            n += len(y)
+    return total / max(n, 1)
 
 
-def _train_nn(name: str, model_cls, train_loader, val_loader, n_features,
-              scaler_params, device, epochs: int):
-    model = model_cls(n_features=n_features).to(device)
-    optim = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE,
-                              weight_decay=WEIGHT_DECAY)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optim, mode="min", patience=5, factor=0.5,
-    )
-    crit  = nn.MSELoss()
+def _train_nn(name: str, model_cls, store, idx_tr, idx_va, spec, device, epochs: int,
+              hidden: int, out_dir: Path) -> float:
+    model = model_cls(hidden_size=hidden).to(device)
+    optim = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode="min", patience=1, factor=0.5)
+    crit = nn.SmoothL1Loss()   # Huber — robust to dust-storm / stubble-burning spikes
+
+    tr = DataLoader(AQISequenceDataset(store, idx_tr, spec), batch_size=BATCH_SIZE, shuffle=True)
+    va = DataLoader(AQISequenceDataset(store, idx_va, spec), batch_size=BATCH_SIZE * 2)
 
     best, stale = float("inf"), 0
-    print(f"\n  Training {name} | epochs={epochs} | device={device}\n")
+    logger.info("Training {} | {} train / {} val windows | epochs={} | device={}",
+                name, len(idx_tr), len(idx_va), epochs, device)
     for ep in range(1, epochs + 1):
-        tr = _epoch(model, train_loader, optim, crit, device, train=True)
-        vl = _epoch(model, val_loader,   optim, crit, device, train=False)
+        t0 = time.time()
+        trl = _epoch(model, tr, optim, crit, device, train=True)
+        vl = _epoch(model, va, optim, crit, device, train=False)
         sched.step(vl)
-
         flag = ""
         if vl < best:
             best, stale = vl, 0
-            save_checkpoint(model, scaler_params, ep, vl)
+            save_checkpoint(model, name.lower(), ep, vl, out_dir)
             flag = "  <- best"
         else:
             stale += 1
-
-        if ep % 5 == 0 or ep == 1:
-            print(f"  {name} {ep:3d}/{epochs} | train={tr:.4f} | val={vl:.4f}{flag}")
-
+        logger.info("{} {:2d}/{} | train={:.4f} | val={:.4f} | {:.0f}s{}",
+                    name, ep, epochs, trl, vl, time.time() - t0, flag)
         if stale >= PATIENCE:
-            print(f"\n  Early stopping {name} at epoch {ep}.")
+            logger.info("Early stopping {} at epoch {}.", name, ep)
             break
-
-    print(f"\n  {name} best val loss: {best:.4f}\n")
     return best
 
 
 # ===========================================================================
-# LightGBM forecaster (tabular flatten of recent window)
+# LightGBM member
 # ===========================================================================
 
-def _build_xgb_dataset(X_seq: np.ndarray, y_seq: np.ndarray, tail: int = XGB_TAIL_HOURS):
-    Xt = X_seq[:, -tail:, :].reshape(X_seq.shape[0], -1)
-    return Xt, y_seq
+def _lgbm_set(store, index, spec, horizons_per_sample: int, seed: int):
+    """Each sample contributes a few random horizons — decorrelates rows, keeps the matrix small."""
+    rng = np.random.default_rng(seed)
+    rep = np.repeat(index, horizons_per_sample, axis=0)
+    hs = rng.integers(1, HORIZON + 1, size=len(rep))
+    X = lgbm_features(store, rep, hs)
+    d = np.stack([store[n].ylog[t + h] - store[n].ylog[t] for (n, t), h in zip(rep, hs)])
+    y = d / spec.target_std[hs - 1]
+    return X, y
 
 
-def _train_lgb(X_seq, y_seq, n_train):
-    X_tab, y_tab = _build_xgb_dataset(X_seq, y_seq)
-    X_tr, y_tr = X_tab[:n_train], y_tab[:n_train]
-    X_va, y_va = X_tab[n_train:], y_tab[n_train:]
+def _train_lgbm(store, idx_tr, idx_va, spec, out_dir: Path, n_samples: int) -> dict:
+    t0 = time.time()
+    X_tr, y_tr = _lgbm_set(store, _subsample(idx_tr, n_samples), spec, 6, seed=1)
+    X_va, y_va = _lgbm_set(store, _subsample(idx_va, n_samples // 4), spec, 4, seed=2)
+    logger.info("LightGBM matrices: train {} | val {} ({:.0f}s)", X_tr.shape, X_va.shape, time.time() - t0)
 
-    # LightGBM handles tabular time-series features better and faster
-    model = LGBMRegressor(
-        n_estimators=600,
-        learning_rate=0.03,
-        num_leaves=31,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        n_jobs=-1
-    )
-    
-    model.fit(
-        X_tr, y_tr, 
-        eval_set=[(X_va, y_va)], 
-        callbacks=[lgb.early_stopping(stopping_rounds=40, verbose=False)]
-    )
-
-    val_rmse = float(np.sqrt(mean_squared_error(y_va, model.predict(X_va))))
-    logger.info("LightGBM forecaster val RMSE (normalised): {:.4f}", val_rmse)
-
-    CHECKPOINT_DIR.mkdir(exist_ok=True)
-    joblib.dump(model, XGB_FORECAST_PATH)
-    print(f"  LightGBM forecaster saved -> {XGB_FORECAST_PATH}\n")
-    return model
+    names = lgbm_feature_names()
+    models = {}
+    for j, p in enumerate(POLLUTANTS):
+        m = lgb.LGBMRegressor(
+            objective="huber", alpha=1.0, n_estimators=1500, learning_rate=0.05,
+            num_leaves=63, min_child_samples=50, subsample=0.8, subsample_freq=1,
+            colsample_bytree=0.7, reg_lambda=1.0, n_jobs=-1, random_state=42, verbose=-1,
+        )
+        m.fit(X_tr, y_tr[:, j], eval_set=[(X_va, y_va[:, j])], feature_name=names,
+              callbacks=[lgb.early_stopping(50, verbose=False)])
+        models[p] = m.booster_   # raw Booster: smaller pickle, predicts at best_iteration
+        logger.info("LightGBM {:<4} best_iter={} val_huber={:.4f}",
+                    p, m.best_iteration_, m.best_score_["valid_0"]["huber"])
+    joblib.dump(models, artifact_paths(out_dir)["lgbm"], compress=3)
+    return models
 
 
 # ===========================================================================
-# Ensemble weight search
+# Ensemble weights
 # ===========================================================================
 
-def _search_weights(lstm_val, gru_val, xgb_val, y_val) -> dict:
-    best, best_w = float("inf"), None
-    grid = np.linspace(0, 1, 11)
-    for a in grid:
-        for b in grid:
-            c = 1.0 - a - b
-            if c < 0 or c > 1:
-                continue
-            blend = a * lstm_val + b * gru_val + c * xgb_val
-            rmse  = float(np.sqrt(mean_squared_error(y_val, blend)))
-            if rmse < best:
-                best, best_w = rmse, {"lstm": float(a), "gru": float(b), "xgb": float(c)}
-    logger.info("Best ensemble weights: {} | val RMSE={:.4f}", best_w, best)
-    ENS_WEIGHTS_PATH.write_text(json.dumps(best_w, indent=2))
-    print(f"  Ensemble weights saved -> {ENS_WEIGHTS_PATH}: {best_w}\n")
-    return best_w
-
-
-def _nn_val_predictions(model, val_loader, device) -> np.ndarray:
-    model.eval()
-    preds = []
-    with torch.no_grad():
-        for X, _ in val_loader:
-            preds.append(model(X.to(device)).cpu().numpy().squeeze(1))
-    return np.concatenate(preds) if preds else np.array([])
+def _search_weights(preds: dict[str, np.ndarray], true_d: np.ndarray, step: float = 0.05) -> dict:
+    """Per-pollutant simplex grid search minimising validation MAE of log-changes."""
+    names = list(preds)
+    grid = np.round(np.arange(0, 1 + 1e-9, step), 4)
+    combos = [c for c in np.array(np.meshgrid(*[grid] * len(names))).T.reshape(-1, len(names))
+              if abs(c.sum() - 1) < 1e-6]
+    weights = {}
+    for j, p in enumerate(POLLUTANTS):
+        stack = np.stack([preds[n][..., j] for n in names])          # (M, N, 24)
+        maes = [np.abs(np.tensordot(c, stack, 1) - true_d[..., j]).mean() for c in combos]
+        best = combos[int(np.argmin(maes))]
+        weights[p] = {n: float(w) for n, w in zip(names, best)}
+        logger.info("Blend weights {:<4}: {} (val MAE {:.4f})", p, weights[p], min(maes))
+    return weights
 
 
 # ===========================================================================
 # Driver
 # ===========================================================================
 
-def run_training(lat: float, lon: float, location_name: str,
-                 which: str = "all", epochs: int = DEFAULT_EPOCHS) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Training device: {}", device)
-
-    df = get_lstm_input_sequence(lat, lon, lookback_hours=720)
-    if df.empty:
-        logger.error("No data in DB for {}. Run the ingestion pipeline first.",
-                     location_name)
-        return
-
+def _git_sha() -> str:
     try:
-        X, y, scaler_params = prepare_sequence(df)
-    except SequenceTooShortError as e:
-        logger.error("{}", e)
-        return
-
-    dataset = AQISequenceDataset(X, y)
-    n_total = len(dataset)
-    n_train = int(0.8 * n_total)
-
-    train_set = Subset(dataset, list(range(n_train)))
-    val_set   = Subset(dataset, list(range(n_train, n_total)))
-
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=False)
-    val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False)
-
-    logger.info("Dataset: {} train / {} val | features={}",
-                n_train, n_total - n_train, X.shape[2])
-
-    want_lstm = which in ("all", "lstm")
-    want_gru  = which in ("all", "gru")
-    want_xgb  = which in ("all", "xgb")
-
-    if want_lstm:
-        if TRANSFORMER_AVAILABLE:
-            logger.info("Phase 3 Detected: Using state-of-the-art PyTorch Transformer")
-            # We keep the name "LSTM" so the checkpoint saves correctly for the API
-            _train_nn("LSTM", AQIForecastTransformer, train_loader, val_loader,
-                      X.shape[2], scaler_params, device, epochs)
-        else:
-            logger.info("Using standard LSTM. (Add AQIForecastTransformer to model.py to upgrade!)")
-            _train_nn("LSTM", AQIForecastLSTM, train_loader, val_loader,
-                      X.shape[2], scaler_params, device, epochs)
-            
-    if want_gru:
-        _train_nn("GRU",  AQIForecastGRU,  train_loader, val_loader,
-                  X.shape[2], scaler_params, device, epochs)
-        
-    if want_xgb:
-        _train_lgb(X, y, n_train)
-
-    if which == "all":
-        from forecasting.model import load_checkpoint
-        lstm_model, _ = load_checkpoint(device, "lstm")
-        gru_model,  _ = load_checkpoint(device, "gru")
-        lgb_model     = joblib.load(XGB_FORECAST_PATH)
-
-        y_val = y[n_train:]
-        lstm_val = _nn_val_predictions(lstm_model, val_loader, device)
-        gru_val  = _nn_val_predictions(gru_model,  val_loader, device)
-        X_tab, _ = _build_xgb_dataset(X, y)
-        lgb_val  = lgb_model.predict(X_tab[n_train:])
-
-        m = min(len(y_val), len(lstm_val), len(gru_val), len(lgb_val))
-        _search_weights(lstm_val[:m], gru_val[:m], lgb_val[:m], y_val[:m])
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+    except Exception:
+        return "nogit"
 
 
-class AQIForecastTransformer(nn.Module):
-    def __init__(self, n_features, d_model=64, n_heads=4, num_layers=2, dropout=0.1):
-        super().__init__()
-        
-        # 1. Expand features
-        self.input_linear = nn.Linear(n_features, d_model)
-        
-        # 2. Time Position Awareness (Crucial for predicting rush hour)
-        self.pos_encoder = nn.Parameter(torch.zeros(1, 168, d_model)) 
-        
-        # 3. The Attention Brain
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=n_heads, 
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # 4. Final output layer
-        self.output_linear = nn.Linear(d_model, 1)
+def run_training(args) -> dict:
+    torch.set_num_threads(os.cpu_count() or 4)
+    torch.manual_seed(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def forward(self, x):
-        x = self.input_linear(x) 
-        x = x + self.pos_encoder[:, :x.size(1), :] 
-        x = self.transformer(x)
-        out = self.output_linear(x[:, -1, :]) 
-        return out
+    nodes, frame = load_frame(args.source, args.data, args.days)
+    store = build_store(frame, nodes)
+    (_, tr_end), (va0, va1), (te0, _) = chronological_splits(store, args.val_days, args.test_days)
+
+    idx_tr = _subsample(sample_index(store, args.stride, None, tr_end), args.max_train)
+    idx_va = _subsample(sample_index(store, args.stride, va0, va1), args.max_eval)
+    idx_te = _subsample(sample_index(store, args.stride, te0), args.max_eval, seed=3)
+    logger.info("Splits | train <{} : {} | val {}→{} : {} | test ≥{} : {}",
+                tr_end, len(idx_tr), va0, va1, len(idx_va), te0, len(idx_te))
+
+    out_dir = CANDIDATE_DIR if args.promote_if_better else CHECKPOINT_DIR
+    if out_dir.exists() and args.promote_if_better:
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = artifact_paths(out_dir)
+
+    spec = fit_spec(store, idx_tr)
+    spec.to_json(paths["spec"])
+    norm = normalise_store(store, spec)
+
+    t0 = time.time()
+    if args.model in ("all", "lstm"):
+        _train_nn("LSTM", AQIForecastLSTM, norm, idx_tr, idx_va, spec, device, args.epochs, args.hidden, out_dir)
+    if args.model in ("all", "gru"):
+        _train_nn("GRU", AQIForecastGRU, norm, idx_tr, idx_va, spec, device, args.epochs, args.hidden, out_dir)
+    if args.model in ("all", "lgbm"):
+        _train_lgbm(norm, idx_tr, idx_va, spec, out_dir, args.lgbm_samples)
+    train_minutes = (time.time() - t0) / 60
+
+    # ── Blend weights + intervals on validation ─────────────────────
+    members = load_members(device, out_dir)
+    val_preds = predict_members(members, norm, idx_va, spec, device)
+    val_true = true_deltas(norm, idx_va)
+    weights = _search_weights(val_preds, val_true)
+    paths["weights"].write_text(json.dumps(weights, indent=2))
+    val_ens = blend(val_preds, weights)
+    quantiles = residual_quantiles(val_true, val_ens)
+
+    # ── Held-out test ───────────────────────────────────────────────
+    test_preds = predict_members(members, norm, idx_te, spec, device)
+    test_preds["ensemble"] = blend(test_preds, weights)
+    interval = {"lo": test_preds["ensemble"] + np.asarray(quantiles["q10"]),
+                "hi": test_preds["ensemble"] + np.asarray(quantiles["q90"])}
+    metrics = score(norm, idx_te, test_preds, interval)
+
+    card = {
+        "model_version": f"{datetime.now(timezone.utc):%Y.%m.%d}-{_git_sha()}",
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "data": {
+            "source": args.source,
+            "nodes": int(len(store)),
+            "start": str(frame["timestamp"].min()),
+            "end": str(frame["timestamp"].max()),
+            "train_windows": int(len(idx_tr)), "val_windows": int(len(idx_va)),
+            "test_windows": int(len(idx_te)),
+            "test_period": [str(te0), str(frame["timestamp"].max())],
+        },
+        "architecture": {"lookback_hours": spec.lookback, "horizon_hours": spec.horizon,
+                         "past_features": len(spec.past_features),
+                         "future_features": len(spec.future_features),
+                         "rnn_hidden": args.hidden, "train_minutes": round(train_minutes, 1)},
+        "ensemble_weights": weights,
+        "residual_quantiles": quantiles,
+        "test": metrics,
+    }
+    paths["card"].write_text(json.dumps(card, indent=1))
+    logger.info("Model card → {}", paths["card"])
+
+    if args.promote_if_better:
+        _champion_challenger(norm_store_raw=store, idx_te=idx_te, candidate_metrics=metrics,
+                             device=device)
+    return card
+
+
+def _champion_challenger(norm_store_raw, idx_te, candidate_metrics: dict, device) -> bool:
+    """Score the deployed champion on the candidate's test window; promote only if not worse."""
+    cand = candidate_metrics["models"]["ensemble"]["aqi_mae"]
+    try:
+        spec = load_spec(CHECKPOINT_DIR)
+        champ_store = normalise_store(norm_store_raw, spec)
+        preds = predict_members(load_members(device, CHECKPOINT_DIR), champ_store, idx_te, spec, device)
+        preds["ensemble"] = blend(preds, load_ensemble_weights(CHECKPOINT_DIR))
+        champ = score(champ_store, idx_te, {"ensemble": preds["ensemble"]})["models"]["ensemble"]["aqi_mae"]
+    except Exception as exc:
+        logger.warning("No usable champion ({}); promoting candidate.", exc)
+        champ = float("inf")
+
+    promote = cand <= champ * PROMOTION_TOLERANCE
+    logger.info("Champion AQI MAE={:.2f} | candidate={:.2f} → {}", champ, cand,
+                "PROMOTE" if promote else "KEEP CHAMPION")
+    if promote:
+        for key, src in artifact_paths(CANDIDATE_DIR).items():
+            if src.exists():
+                shutil.copy2(src, artifact_paths(CHECKPOINT_DIR)[key])
+    shutil.rmtree(CANDIDATE_DIR, ignore_errors=True)
+    return promote
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Train the pan-India AQ forecast ensemble.")
+    parser.add_argument("--source", choices=["parquet", "db"], default="parquet")
+    parser.add_argument("--data", default="data/history.parquet")
+    parser.add_argument("--days", type=int, default=120, help="History to load with --source db")
+    parser.add_argument("--model", choices=["all", "lstm", "gru", "lgbm"], default="all")
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--hidden", type=int, default=64)
+    parser.add_argument("--stride", type=int, default=6, help="Hours between training windows per node")
+    parser.add_argument("--max-train", type=int, default=None, help="Cap on NN training windows")
+    parser.add_argument("--max-eval", type=int, default=20000, help="Cap on val/test windows")
+    parser.add_argument("--lgbm-samples", type=int, default=100000)
+    parser.add_argument("--val-days", type=int, default=21)
+    parser.add_argument("--test-days", type=int, default=35)
+    parser.add_argument("--promote-if-better", action="store_true")
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--location", required=True)
-    parser.add_argument("--model", choices=["all", "lstm", "gru", "xgb"], default="all")
-    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
-    args = parser.parse_args()
-
-    geo = geocode(args.location)
-    run_training(lat=geo.lat, lon=geo.lon, location_name=geo.display_name,
-                 which=args.model, epochs=args.epochs)
+    run_training(parse_args())

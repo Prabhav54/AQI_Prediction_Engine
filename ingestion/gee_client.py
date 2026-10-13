@@ -19,6 +19,7 @@ import pandas as pd
 import numpy as np
 
 from config.settings import GEE_KEY_FILE, GEE_SERVICE_ACCOUNT, EE_PROJECT_ID, GEE_BANDS, LOOKBACK_DAYS
+from exceptions import GEEAuthError
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,8 @@ logger = logging.getLogger(__name__)
 # Lazy GEE import — only fails at runtime if earthengine-api isn't installed.
 # This allows the rest of the codebase to import without GEE credentials.
 # ---------------------------------------------------------------------------
+
+
 def _init_gee() -> None:
     """
     Initialize GEE. Tries service account first (Mode B); falls back to
@@ -81,7 +84,7 @@ def _sample_image_collection(
     ee,                     # earthengine module, passed to avoid re-import
     collection_id: str,
     band: str,
-    point: "ee.Geometry.Point",
+    point,                  # ee.Geometry.Point
     start: datetime,
     end: datetime,
     scale_m: int = 5000,    # spatial resolution for sampling (metres)

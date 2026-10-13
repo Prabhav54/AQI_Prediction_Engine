@@ -1,11 +1,11 @@
 from setuptools import setup, find_packages
 from pathlib import Path
- 
+
 # Read long description from README
 _here = Path(__file__).parent
 long_description = (_here / "README.md").read_text(encoding="utf-8") \
     if (_here / "README.md").exists() else ""
- 
+
 setup(
     name="pan-india-aq-engine",
     version="0.1.0",
@@ -17,10 +17,10 @@ setup(
     long_description_content_type="text/markdown",
     author="Prabhav",
     python_requires=">=3.11,<3.12",  # Pin to 3.11 (see README for rationale)
- 
+
     # Discovers all packages with an __init__.py
     packages=find_packages(exclude=["tests*", "logs*"]),
- 
+
     # Runtime dependencies (minimal; full stack is in environment.yml)
     install_requires=[
         "numpy>=1.26,<2.0",
@@ -39,7 +39,7 @@ setup(
         "streamlit>=1.32",
         "plotly>=5.20",
     ],
- 
+
     extras_require={
         # Install with: pip install -e ".[dev]"
         "dev": [
@@ -59,7 +59,7 @@ setup(
             "torch>=2.2",
         ],
     },
- 
+
     entry_points={
         "console_scripts": [
             # Run Module 1 pipeline from the command line:
@@ -67,7 +67,7 @@ setup(
             "aq-ingest=ingestion.pipeline:main",
         ],
     },
- 
+
     classifiers=[
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.11",
@@ -76,7 +76,7 @@ setup(
         "Topic :: Scientific/Engineering :: Atmospheric Science",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
- 
+
     include_package_data=True,
     package_data={
         "": ["*.sql", "*.json", "*.yml"],

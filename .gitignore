@@ -55,14 +55,20 @@ venv.bak/
 # ── ML artifacts (large binary files — use DVC or Git LFS) ──
 proxy_model/artifacts/*.joblib
 proxy_model/artifacts/*.pkl
-forecasting/checkpoints/
-forecasting/checkpoints/*.pt
-forecasting/checkpoints/*.pth
+# Deployed model generation is versioned in git (small files; retrain.yml commits promotions)
+forecasting/checkpoints/*
+!forecasting/checkpoints/lstm.pt
+!forecasting/checkpoints/gru.pt
+!forecasting/checkpoints/lgbm.joblib
+!forecasting/checkpoints/feature_spec.json
+!forecasting/checkpoints/ensemble_weights.json
+!forecasting/checkpoints/model_card.json
 *.onnx
 
 # ── Data files ───────────────────────────────────────────────
 data/
 *.csv
+!ingestion/nodes/*.csv
 *.parquet
 *.feather
 *.h5
@@ -131,3 +137,6 @@ docker-compose.override.yml
 !proxy_model/artifacts/.gitkeep
 !requirements.txt
 !environment.yml
+
+# Vercel
+.vercel

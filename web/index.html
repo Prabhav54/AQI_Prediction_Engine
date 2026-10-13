@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pan-India AQI Forecast</title>
+<meta name="description" content="24-hour CPCB AQI and pollutant forecasts for every part of India from an LSTM + GRU + LightGBM ensemble.">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #111418; --muted: #5d6673; --line: #e3e6eb;
+    --accent: #2f6fed; --band: rgba(47,111,237,.14);
+    --good: #2e9e5b; --sat: #8bc34a; --mod: #e6b800; --poor: #f08c00; --vpoor: #e03131; --sev: #8e1b3a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0d1014; --panel: #161a20; --ink: #e8ebef; --muted: #98a1ad; --line: #262c35;
+      --accent: #5b8cff; --band: rgba(91,140,255,.18);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0d1014; --panel: #161a20; --ink: #e8ebef; --muted: #98a1ad; --line: #262c35;
+    --accent: #5b8cff; --band: rgba(91,140,255,.18);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--bg); color: var(--ink); font: 14px/1.45 Inter, system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 700; letter-spacing: -.01em; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .search { margin-left: auto; position: relative; width: min(320px, 100%); }
+  .search input { width: 100%; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; }
+  .search ul { position: absolute; z-index: 1000; top: 100%; left: 0; right: 0; margin: 4px 0 0; padding: 4px; list-style: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; max-height: 280px; overflow: auto; display: none; }
+  .search li { padding: 6px 8px; border-radius: 6px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+  .search li:hover, .search li.active { background: var(--bg); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 420px; height: calc(100% - 57px); }
+  #map { height: 100%; background: var(--bg); }
+  aside { overflow-y: auto; border-left: 1px solid var(--line); background: var(--panel); padding: 16px; }
+  .card { border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  .place { font-size: 18px; font-weight: 700; margin: 0; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .now { display: flex; align-items: center; gap: 14px; margin-top: 10px; }
+  .big { font-size: 48px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+  .chip { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; color: #fff; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 5px 4px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; }
+  tr.hl td { font-weight: 700; }
+  .legend { position: absolute; z-index: 500; left: 12px; bottom: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; font-size: 11.5px; }
+  .legend div { display: flex; align-items: center; gap: 6px; }
+  .legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .banner { padding: 8px 12px; border-radius: 8px; background: var(--band); font-size: 12.5px; margin-bottom: 12px; display: none; }
+  .empty { color: var(--muted); text-align: center; padding: 40px 10px; }
+  canvas { max-width: 100%; }
+  .note { color: var(--muted); font-size: 11.5px; margin-top: 8px; }
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 55vh auto; height: auto; }
+    aside { border-left: 0; border-top: 1px solid var(--line); }
+    .search { margin-left: 0; width: 100%; }
+  }
+  .leaflet-container { font: inherit; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Pan-India AQI Forecast</h1>
+    <div class="sub" id="updated">Loading…</div>
+  </div>
+  <div class="search">
+    <input id="q" type="search" placeholder="Search a city or state…" autocomplete="off" aria-label="Search location">
+    <ul id="results" role="listbox"></ul>
+  </div>
+</header>
+<main>
+  <div style="position:relative">
+    <div id="map" aria-label="Map of AQI across India"></div>
+    <div class="legend" id="legend"></div>
+  </div>
+  <aside>
+    <div class="banner" id="banner"></div>
+    <div id="detail"><div class="empty">Select any point on the map or search a city to see its 24-hour forecast.</div></div>
+    <div class="card" id="skill"><h2>Model performance</h2><div class="meta">Loading…</div></div>
+  </aside>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+const CATS = [
+  ["Good", "--good", 50], ["Satisfactory", "--sat", 100], ["Moderate", "--mod", 200],
+  ["Poor", "--poor", 300], ["Very Poor", "--vpoor", 400], ["Severe", "--sev", 500],
+];
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const catColor = c => css((CATS.find(x => x[0] === c) || CATS[2])[1]);
+const aqiColor = a => catColor((CATS.find(x => a <= x[2]) || CATS[5])[0]);
+const fmtTime = t => new Date(t).toLocaleString("en-IN", { hour: "2-digit", minute: "2-digit", day: "numeric", month: "short", timeZone: "Asia/Kolkata" });
+const POLS = [["pm25", "PM2.5", "µg/m³"], ["pm10", "PM10", "µg/m³"], ["no2", "NO₂", "µg/m³"], ["so2", "SO₂", "µg/m³"], ["co", "CO", "mg/m³"], ["o3", "O₃", "µg/m³"]];
+
+let snapshot = null, nodes = [], markers = {}, chart = null, selected = null;
+
+async function api(path) {
+  if (!snapshot) {
+    try {
+      const r = await fetch(path);
+      if (r.ok) return r.json();
+      if (r.status !== 503) throw new Error(`${r.status}`);
+    } catch (e) { if (String(e).match(/^Error: \d/)) throw e; }
+    snapshot = await (await fetch("/snapshot.json")).json();
+    const b = document.getElementById("banner");
+    b.style.display = "block";
+    b.textContent = `Showing a saved snapshot from ${fmtTime(snapshot.generated_at)} IST — the live database is not connected.`;
+  }
+  if (path === "/api/nodes") return { generated_at: snapshot.generated_at, nodes: snapshot.nodes };
+  if (path === "/api/skill") return snapshot.skill;
+  const h = path.split("/").pop();
+  if (!snapshot.details[h]) throw new Error("404");
+  return snapshot.details[h];
+}
+
+const map = L.map("map", { zoomControl: true, preferCanvas: true }).setView([22.5, 80], 5);
+function tiles() {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  return L.tileLayer(`https://{s}.basemaps.cartocdn.com/${dark ? "dark_all" : "light_all"}/{z}/{x}/{y}{r}.png`, {
+    attribution: '&copy; OpenStreetMap &copy; CARTO | Data: Open-Meteo / Copernicus CAMS', maxZoom: 10, minZoom: 4,
+  });
+}
+tiles().addTo(map);
+map.setMaxBounds([[2, 60], [40, 102]]);
+
+document.getElementById("legend").innerHTML = CATS.map(([n, v, hi]) =>
+  `<div><i style="background:${css(v)}"></i>${n} <span style="color:var(--muted)">≤${hi}</span></div>`).join("");
+
+async function loadNodes() {
+  const d = await api("/api/nodes");
+  nodes = d.nodes;
+  const latest = nodes.reduce((m, n) => n.t > m ? n.t : m, "");
+  document.getElementById("updated").textContent =
+    `${nodes.length} locations · CPCB AQI as of ${latest ? fmtTime(latest) : "—"} IST`;
+  for (const n of nodes) {
+    const m = L.circleMarker([n.lat, n.lon], {
+      radius: n.kind === "city" ? 6 : 4.5, weight: n.kind === "city" ? 1.5 : 0,
+      color: css("--ink"), fillColor: aqiColor(n.aqi), fillOpacity: .9,
+    }).addTo(map);
+    m.bindTooltip(`<b>${n.name}</b><br>AQI ${n.aqi} · ${n.cat} · ${n.pol}`);
+    m.on("click", () => select(n.h));
+    markers[n.h] = m;
+  }
+  const delhi = nodes.find(n => n.name === "Delhi");
+  if (delhi) select(delhi.h, false);
+}
+
+async function select(h, fly = true) {
+  selected = h;
+  const n = nodes.find(x => x.h === h);
+  if (fly && n) map.flyTo([n.lat, n.lon], Math.max(map.getZoom(), 7), { duration: .6 });
+  Object.entries(markers).forEach(([k, m]) => m.setStyle({ weight: k === h ? 3 : (nodes.find(x => x.h === k)?.kind === "city" ? 1.5 : 0) }));
+  let d;
+  try { d = await api(`/api/node/${h}`); }
+  catch { document.getElementById("detail").innerHTML = `<div class="empty">No recent data for this location.</div>`; return; }
+  if (selected !== h) return;
+  renderDetail(d);
+}
+
+function renderDetail({ node, forecast, history }) {
+  const peak = forecast.reduce((m, f) => f.aqi > m.aqi ? f : m, forecast[0] || { aqi: 0 });
+  const at = k => forecast.find(f => f.hours_ahead === k);
+  const rows = POLS.map(([k, label, unit]) => {
+    const cells = [6, 12, 24].map(hh => at(hh)?.[k]);
+    const dp = k === "co" ? 2 : 0;
+    return `<tr><td>${label} <span class="meta">${unit}</span></td>${cells.map(v => `<td>${v == null ? "—" : Number(v).toFixed(dp)}</td>`).join("")}</tr>`;
+  }).join("");
+  const last = forecast[forecast.length - 1] || {};
+  document.getElementById("detail").innerHTML = `
+    <div class="card">
+      <p class="place">${node.location_name}</p>
+      <div class="meta">${node.state || ""} · ${node.lat.toFixed(2)}°N, ${node.lon.toFixed(2)}°E · ${node.kind === "city" ? "city node" : "grid node"}</div>
+      <div class="now">
+        <div class="big" style="color:${catColor(node.aqi_category)}">${node.aqi}</div>
+        <div>
+          <span class="chip" style="background:${catColor(node.aqi_category)}">${node.aqi_category}</span>
+          <div class="meta" style="margin-top:6px">Prominent: <b>${node.prominent_pollutant}</b> · ${fmtTime(node.timestamp)} IST</div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Next 24 hours</h2>
+      ${forecast.length ? `<div class="meta" style="margin-bottom:8px">Peak <b style="color:${catColor(peak.aqi_category)}">${peak.aqi} (${peak.aqi_category})</b> at ${fmtTime(peak.forecast_target_time)} · shaded band = 80% interval</div>
+      <canvas id="chart" height="210" aria-label="AQI history and 24-hour forecast"></canvas>` : `<div class="meta">No forecast run yet for this location.</div>`}
+    </div>
+    ${forecast.length ? `<div class="card">
+      <h2>Pollutant outlook</h2>
+      <table><thead><tr><th></th><th>+6h</th><th>+12h</th><th>+24h</th></tr></thead><tbody>${rows}</tbody></table>
+      <div class="note">Hourly concentrations. AQI uses CPCB 24h means (PM, NO₂, SO₂) and 8h means (CO, O₃).</div>
+    </div>
+    <div class="card">
+      <h2>Ensemble members at +24h</h2>
+      <table><thead><tr><th>Model</th><th>AQI</th></tr></thead><tbody>
+        <tr><td>LSTM</td><td>${last.aqi_lstm ?? "—"}</td></tr>
+        <tr><td>GRU</td><td>${last.aqi_gru ?? "—"}</td></tr>
+        <tr><td>LightGBM</td><td>${last.aqi_lgbm ?? "—"}</td></tr>
+        <tr class="hl"><td>Blended ensemble</td><td>${last.aqi ?? "—"}</td></tr>
+      </tbody></table>
+      <div class="note">Model ${last.model_version || "—"} · issued ${fmtTime(last.forecast_generated_at)} IST</div>
+    </div>` : ""}`;
+  if (forecast.length) drawChart(history, forecast);
+}
+
+function drawChart(history, forecast) {
+  if (chart) chart.destroy();
+  const ink = css("--muted"), line = css("--line"), acc = css("--accent");
+  const pts = a => a.map(([x, y]) => ({ x: new Date(x).getTime(), y }));
+  chart = new Chart(document.getElementById("chart"), {
+    type: "line",
+    data: { datasets: [
+      { label: "Upper", data: pts(forecast.map(f => [f.forecast_target_time, f.aqi_upper])), borderWidth: 0, pointRadius: 0, fill: false },
+      { label: "80% interval", data: pts(forecast.map(f => [f.forecast_target_time, f.aqi_lower])), borderWidth: 0, pointRadius: 0, fill: "-1", backgroundColor: css("--band") },
+      { label: "Observed", data: pts(history.map(h => [h.timestamp, h.aqi])), borderColor: ink, borderWidth: 1.6, pointRadius: 0, tension: .25 },
+      { label: "Forecast", data: pts(forecast.map(f => [f.forecast_target_time, f.aqi])), borderColor: acc, borderWidth: 2.4, pointRadius: 0, tension: .25 },
+    ]},
+    options: {
+      animation: false, parsing: false, interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { labels: { color: ink, boxWidth: 12, filter: i => i.text !== "Upper" } },
+        tooltip: { callbacks: { title: i => fmtTime(i[0].parsed.x) + " IST" } },
+      },
+      scales: {
+        x: { type: "linear", ticks: { color: ink, maxTicksLimit: 6, callback: v => new Date(v).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", timeZone: "Asia/Kolkata" }) }, grid: { color: line } },
+        y: { beginAtZero: true, ticks: { color: ink }, grid: { color: line }, title: { display: true, text: "CPCB AQI", color: ink } },
+      },
+    },
+  });
+}
+
+async function loadSkill() {
+  const el = document.getElementById("skill");
+  let s;
+  try { s = await api("/api/skill"); } catch { el.querySelector(".meta").textContent = "Unavailable."; return; }
+  const m = s?.test?.models;
+  if (!m) { el.querySelector(".meta").textContent = "No trained model registered yet."; return; }
+  const order = [["persistence", "Persistence (baseline)"], ["seasonal_naive", "Same hour yesterday"], ["lstm", "LSTM"], ["gru", "GRU"], ["lgbm", "LightGBM"], ["ensemble", "Ensemble"]];
+  const live = (s.live_by_horizon || []);
+  const liveMae = live.length ? live.reduce((a, r) => a + r.aqi_mae * r.n, 0) / live.reduce((a, r) => a + r.n, 0) : null;
+  const livePer = live.length ? live.reduce((a, r) => a + r.persistence_aqi_mae * r.n, 0) / live.reduce((a, r) => a + r.n, 0) : null;
+  el.innerHTML = `<h2>Model performance</h2>
+    <table><thead><tr><th>Held-out test</th><th>AQI MAE</th><th>Category hit</th><th>Skill</th></tr></thead><tbody>
+    ${order.filter(([k]) => m[k]).map(([k, label]) => `<tr class="${k === "ensemble" ? "hl" : ""}"><td>${label}</td>
+      <td>${m[k].aqi_mae.toFixed(1)}</td><td>${(m[k].aqi_category_accuracy * 100).toFixed(1)}%</td>
+      <td>${k === "persistence" ? "—" : (m[k].aqi_skill_vs_persistence * 100).toFixed(0) + "%"}</td></tr>`).join("")}
+    </tbody></table>
+    <div class="note">Test window ${s.data?.test_period?.map(t => t.slice(0, 10)).join(" → ") || ""} · ${s.test?.n_samples?.toLocaleString() || ""} forecasts at ${s.data?.nodes || ""} nodes, every horizon 1–24h.
+    Skill = MAE reduction vs persistence.${s.test?.interval_80_coverage_aqi ? ` 80% interval coverage: ${(s.test.interval_80_coverage_aqi * 100).toFixed(0)}%.` : ""}</div>
+    ${liveMae != null ? `<div class="note"><b>Live (last 7 days):</b> AQI MAE ${liveMae.toFixed(1)} vs persistence ${livePer.toFixed(1)}.</div>` : ""}`;
+}
+
+// Search over node names / states
+const q = document.getElementById("q"), results = document.getElementById("results");
+q.addEventListener("input", () => {
+  const t = q.value.trim().toLowerCase();
+  if (!t) { results.style.display = "none"; return; }
+  const hits = nodes.filter(n => n.name.toLowerCase().includes(t) || (n.state || "").toLowerCase().includes(t))
+    .sort((a, b) => (a.kind === "city" ? 0 : 1) - (b.kind === "city" ? 0 : 1) || a.name.localeCompare(b.name)).slice(0, 12);
+  results.innerHTML = hits.map(n => `<li data-h="${n.h}"><span>${n.name}</span><span style="color:${aqiColor(n.aqi)};font-weight:700">${n.aqi}</span></li>`).join("")
+    || `<li style="color:var(--muted)">No match</li>`;
+  results.style.display = "block";
+});
+results.addEventListener("click", e => {
+  const li = e.target.closest("li[data-h]"); if (!li) return;
+  results.style.display = "none"; q.value = ""; select(li.dataset.h);
+});
+document.addEventListener("click", e => { if (!e.target.closest(".search")) results.style.display = "none"; });
+
+loadNodes().catch(() => document.getElementById("updated").textContent = "Could not load data.");
+loadSkill();
+</script>
+</body>
+</html>

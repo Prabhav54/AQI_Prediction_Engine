@@ -30,6 +30,7 @@ try:
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
+
     class Console:
         def print(self, *args, **kwargs): print(*args)
     console = Console()
@@ -90,7 +91,7 @@ def check_env():
     required_vars = [
         ("DATABASE_URL",       True,  "PostgreSQL connection string"),
         ("DATABASE_URL_SYNC",  True,  "Sync PostgreSQL URL for migrations"),
-        ("GEE_SERVICE_ACCOUNT",False, "GEE service account email"),
+        ("GEE_SERVICE_ACCOUNT", False, "GEE service account email"),
         ("GEE_KEY_FILE",       False, "Path to GEE JSON key"),
         ("API_SECRET_KEY",     False, "FastAPI JWT secret"),
     ]
@@ -335,7 +336,7 @@ def print_summary(write_report: bool = False):
     if write_report:
         report_path = f"setup_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         with open(report_path, "w") as f:
-            f.write(f"Pan-India AQ Engine — Setup Report\n")
+            f.write("Pan-India AQ Engine — Setup Report\n")
             f.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n")
             for r in results:
                 f.write(f"{r['status']:12}  {r['name']:40}  {r['detail']}\n")
