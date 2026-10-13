@@ -89,7 +89,7 @@ app = FastAPI(
         "2. `GET /aqi` — fetch the computed CPCB AQI\n"
         "3. `GET /forecast` — get the 24-hour LSTM + XGBoost ensemble forecast"
     ),
-    version     = "0.1.0",
+    version     = "2.0.0",
     lifespan    = lifespan,
 )
 
@@ -139,19 +139,12 @@ async def health() -> dict:
     except Exception as exc:
         status["db"] = f"error: {exc}"
 
-    # Check model artifacts
-    proxy_ok    = Path("proxy_model/artifacts/xgb_pm25_proxy.joblib").exists()
-    lstm_ok     = Path("forecasting/checkpoints/lstm_aqi.pt").exists()
-    ensemble_ok = Path("forecasting/checkpoints/xgb_forecaster.joblib").exists()
-
-    if proxy_ok and lstm_ok and ensemble_ok:
-        status["models"] = "ready"
-    else:
-        missing = []
-        if not proxy_ok:    missing.append("proxy model")
-        if not lstm_ok:     missing.append("LSTM checkpoint")
-        if not ensemble_ok: missing.append("XGBoost forecaster")
-        status["models"] = f"not ready — missing: {', '.join(missing)}"
+    # Check model artifacts (the proxy model is an optional gap-filler)
+    ckpt = _PROJECT_ROOT / "forecasting" / "checkpoints"
+    required = {"LSTM": "lstm.pt", "GRU": "gru.pt", "LightGBM": "lgbm.joblib",
+                "feature spec": "feature_spec.json"}
+    missing = [name for name, f in required.items() if not (ckpt / f).exists()]
+    status["models"] = "ready" if not missing else f"not ready — missing: {', '.join(missing)}"
 
     return status
 

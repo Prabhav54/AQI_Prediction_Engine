@@ -6,7 +6,6 @@ Loads secrets from .env; exposes typed constants to all modules.
 """
 
 import os
-from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -36,6 +35,36 @@ EE_PROJECT_ID: str       = os.getenv("EE_PROJECT_ID", "")   # required since GEE
 # ---------------------------------------------------------------------------
 OPEN_METEO_BASE_URL: str = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_ARCHIVE_URL: str = "https://archive-api.open-meteo.com/v1/archive"
+OPEN_METEO_AQ_URL: str = "https://air-quality-api.open-meteo.com/v1/air-quality"
+
+# Free tier: 600 calls/min, 5k/hour, 10k/day. Each location in a multi-location
+# request counts as one call (more for long date ranges), so we batch nodes and
+# throttle on a weighted per-minute budget.
+OPEN_METEO_BATCH_SIZE: int = int(os.getenv("OPEN_METEO_BATCH_SIZE", "50"))
+OPEN_METEO_CALLS_PER_MIN: int = int(os.getenv("OPEN_METEO_CALLS_PER_MIN", "450"))
+
+# ---------------------------------------------------------------------------
+# Pan-India node set
+# ---------------------------------------------------------------------------
+# Grid nodes give uniform coverage; city nodes (config/cities.py) are added on top.
+# 1.0° (~110 km) + cities ≈ 380 nodes → fits the free Open-Meteo quota when the
+# pipeline runs every 3 hours. Use 0.5° (~1,150 grid nodes) with a paid key or a
+# slower cadence.
+GRID_RESOLUTION_DEG: float = float(os.getenv("GRID_RESOLUTION_DEG", "1.0"))
+INDIA_BOUNDARY_URL: str = (
+    "https://raw.githubusercontent.com/datameet/maps/master/Country/india-composite.geojson"
+)
+
+# ---------------------------------------------------------------------------
+# Pollutants (model targets) — CPCB units: µg/m³ except CO in mg/m³
+# ---------------------------------------------------------------------------
+POLLUTANTS: list[str] = ["pm25", "pm10", "no2", "so2", "co", "o3"]
+
+# ---------------------------------------------------------------------------
+# Retention (enforced by run_pipeline.py prune — works with or without TimescaleDB)
+# ---------------------------------------------------------------------------
+RAW_RETENTION_DAYS: int = int(os.getenv("RAW_RETENTION_DAYS", "120"))
+FORECAST_RETENTION_DAYS: int = int(os.getenv("FORECAST_RETENTION_DAYS", "30"))
 
 # ---------------------------------------------------------------------------
 # Nominatim (OpenStreetMap geocoding — free, no key required)
@@ -46,7 +75,7 @@ NOMINATIM_USER_AGENT: str = "pan_india_aq_engine/1.0"
 # ---------------------------------------------------------------------------
 # Ingestion windows
 # ---------------------------------------------------------------------------
-LOOKBACK_DAYS: int = 7          # historical window for each ETL run
+LOOKBACK_DAYS: int = 8          # historical window for each ETL run (≥ 168h + buffer)
 FORECAST_HOURS: int = 24        # prediction horizon
 LSTM_LOOKBACK_HOURS: int = 168  # 7 days × 24h — LSTM input sequence length
 

@@ -1,17 +1,62 @@
-version: '3.8'
-
+# Local stack: TimescaleDB + API + Streamlit, plus an on-demand pipeline job.
+#   docker compose up -d                       # db, schema, api, ui
+#   docker compose run --rm pipeline           # one ingest → forecast pass
 services:
   db:
-    image: postgis/postgis:15-3.3
-    container_name: aqi_spatial_db
+    image: timescale/timescaledb-ha:pg16       # TimescaleDB + PostGIS
+    container_name: aqi_db
     environment:
-      POSTGRES_USER: aqi_admin
-      POSTGRES_PASSWORD: aqi_password
-      POSTGRES_DB: aqi_pan_india
+      POSTGRES_USER: aq_user
+      POSTGRES_PASSWORD: aq_pass
+      POSTGRES_DB: air_quality_db
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pgdata:/home/postgres/pgdata/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aq_user -d air_quality_db"]
+      interval: 5s
+      retries: 20
+
+  setup:
+    build: .
+    command: python database/setup_db.py
+    environment: &dbenv
+      DATABASE_URL_SYNC: postgresql://aq_user:aq_pass@db:5432/air_quality_db
+      LOG_LEVEL: INFO
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: .
+    environment:
+      <<: *dbenv
+      CORS_ORIGINS: http://localhost:8501
+    ports:
+      - "8000:8000"
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+  ui:
+    build: .
+    command: streamlit run ui/app.py --server.port 8501 --server.address 0.0.0.0
+    environment:
+      API_BASE: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+
+  pipeline:
+    build: .
+    command: python run_pipeline.py all
+    environment: *dbenv
+    profiles: ["jobs"]
+    depends_on:
+      setup:
+        condition: service_completed_successfully
 
 volumes:
-  postgres_data:
+  pgdata:

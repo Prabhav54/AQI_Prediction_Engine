@@ -45,129 +45,63 @@ F = TypeVar("F", bound=Callable[..., Any])
 # Reference: CPCB National Air Quality Index, November 2014
 # https://cpcb.nic.in/National-Air-Quality-Index.php
 #
-# NOTE: The canonical calculation lives in database/aqi_sql.sql (Module 3).
-# This Python version is used for:
-#   - Unit tests to validate SQL output
-#   - Proxy model output verification
+# NOTE: The canonical calculation lives in database/schema.sql (refresh_aqi).
+# This Python mirror is used for:
+#   - AQI on *forecast* hours (history + predicted concentrations)
+#   - Unit tests that pin it to the SQL implementation
 #   - Offline / mock runs without a DB connection
 
-_CPCB_BREAKPOINTS: dict[str, list[tuple[float, float, float, float]]] = {
-    # (Bp_low, Bp_high, I_low, I_high)
-    "pm25": [
-        (0,    30,   0,   50),
-        (31,   60,   51,  100),
-        (61,   90,   101, 200),
-        (91,   120,  201, 300),
-        (121,  250,  301, 400),
-        (251,  500,  401, 500),
-    ],
-    "pm10": [
-        (0,    50,   0,   50),
-        (51,   100,  51,  100),
-        (101,  250,  101, 200),
-        (251,  350,  201, 300),
-        (351,  430,  301, 400),
-        (431,  600,  401, 500),
-    ],
-    "no2": [
-        (0,    40,   0,   50),
-        (41,   80,   51,  100),
-        (81,   180,  101, 200),
-        (181,  280,  201, 300),
-        (281,  400,  301, 400),
-        (401,  800,  401, 500),
-    ],
-    "so2": [
-        (0,    40,   0,   50),
-        (41,   80,   51,  100),
-        (81,   380,  101, 200),
-        (381,  800,  201, 300),
-        (801,  1600, 301, 400),
-        (1601, 2100, 401, 500),
-    ],
-    "co": [
-        (0,    1.0,  0,   50),
-        (1.1,  2.0,  51,  100),
-        (2.1,  10.0, 101, 200),
-        (10.1, 17.0, 201, 300),
-        (17.1, 34.0, 301, 400),
-        (34.1, 50.0, 401, 500),
-    ],
-    "o3": [
-        (0,    50,   0,   50),
-        (51,   100,  51,  100),
-        (101,  168,  101, 200),
-        (169,  208,  201, 300),
-        (209,  748,  301, 400),
-        (749,  1000, 401, 500),
-    ],
+# Concentration breakpoints mapping onto AQI 0, 50, 100, 200, 300, 400, 500.
+# Must match the ARRAY[...] literals in refresh_aqi().
+CPCB_INDEX_LEVELS = np.array([0, 50, 100, 200, 300, 400, 500], dtype=float)
+CPCB_BREAKPOINTS: dict[str, np.ndarray] = {
+    "pm25": np.array([0, 30, 60, 90, 120, 250, 380], dtype=float),
+    "pm10": np.array([0, 50, 100, 250, 350, 430, 600], dtype=float),
+    "no2": np.array([0, 40, 80, 180, 280, 400, 800], dtype=float),
+    "so2": np.array([0, 40, 80, 380, 800, 1600, 2100], dtype=float),
+    "co": np.array([0, 1, 2, 10, 17, 34, 50], dtype=float),  # mg/m³
+    "o3": np.array([0, 50, 100, 168, 208, 748, 1000], dtype=float),
 }
+# CPCB averaging windows (hours): 24h mean for PM/NO2/SO2, 8h mean for CO/O3
+CPCB_WINDOWS: dict[str, int] = {"pm25": 24, "pm10": 24, "no2": 24, "so2": 24, "co": 8, "o3": 8}
+_AGG_NAMES = {
+    "pm25": "pm25_24h_avg", "pm10": "pm10_24h_avg", "no2": "no2_24h_avg",
+    "so2": "so2_24h_avg", "co": "co_8h_avg", "o3": "o3_8h_avg",
+}
+_LABELS = {"pm25": "PM2.5", "pm10": "PM10", "no2": "NO2", "so2": "SO2", "co": "CO", "o3": "O3"}
+
+
+def cpcb_sub_index(concentration, pollutant: str):
+    """
+    Vectorised CPCB piecewise-linear sub-index:
+
+        I_p = I_lo + (C_p - Bp_lo) × (I_hi - I_lo) / (Bp_hi - Bp_lo)
+
+    Accepts a scalar or array; NaN stays NaN; values above the top
+    breakpoint cap at 500 (np.interp clamps at the edges).
+    """
+    bp = CPCB_BREAKPOINTS.get(pollutant.lower())
+    if bp is None:
+        raise ValueError(f"Unknown pollutant: '{pollutant}'. Valid: {list(CPCB_BREAKPOINTS)}")
+    c = np.clip(np.asarray(concentration, dtype=float), 0, None)
+    out = np.interp(c, bp, CPCB_INDEX_LEVELS)
+    return np.where(np.isnan(c), np.nan, out)
 
 
 def compute_sub_index(concentration: float, pollutant: str) -> Optional[float]:
-    """
-    Apply the CPCB linear interpolation formula for a single pollutant.
-
-        I_p = [(I_hi - I_lo) / (Bp_hi - Bp_lo)] × (C_p - Bp_lo) + I_lo
-
-    Parameters
-    ----------
-    concentration : float
-        Measured or estimated concentration in CPCB units (µg/m³ for
-        PM2.5/PM10/NO₂/SO₂/O₃; mg/m³ for CO).
-    pollutant : str
-        One of: 'pm25', 'pm10', 'no2', 'so2', 'co', 'o3'.
-
-    Returns
-    -------
-    float or None
-        Sub-index value [0, 500], or None if concentration is NaN or
-        exceeds the highest breakpoint.
-    """
-    if pd.isna(concentration) or concentration < 0:
+    """Scalar wrapper around cpcb_sub_index — returns None for missing data."""
+    if concentration is None or pd.isna(concentration):
         return None
-
-    breakpoints = _CPCB_BREAKPOINTS.get(pollutant.lower())
-    if breakpoints is None:
-        raise ValueError(f"Unknown pollutant: '{pollutant}'. "
-                         f"Valid: {list(_CPCB_BREAKPOINTS)}")
-
-    for bp_lo, bp_hi, i_lo, i_hi in breakpoints:
-        if bp_lo <= concentration <= bp_hi:
-            return ((i_hi - i_lo) / (bp_hi - bp_lo)) * (concentration - bp_lo) + i_lo
-
-    # Above highest breakpoint → cap at 500
-    if concentration > breakpoints[-1][1]:
-        logger.warning(
-            "Concentration %.2f for '%s' exceeds max breakpoint %.2f; capping at 500.",
-            concentration, pollutant, breakpoints[-1][1],
-        )
-        return 500.0
-
-    return None
+    return float(cpcb_sub_index(concentration, pollutant))
 
 
 def compute_aqi(pollutant_concentrations: dict[str, float]) -> dict[str, Any]:
     """
-    Compute the composite AQI and prominent pollutant from a dict of
-    concentrations.
+    Composite AQI from already-averaged concentrations (24h / 8h means).
 
-    Parameters
-    ----------
-    pollutant_concentrations : dict
-        Keys: pollutant names ('pm25', 'pm10', 'no2', 'so2', 'co', 'o3').
-        Values: measured concentration in CPCB standard units.
-
-    Returns
-    -------
-    dict with keys:
-        aqi              : int   — final AQI (GREATEST of sub-indices)
-        prominent_pollutant : str — pollutant driving the AQI
-        sub_indices      : dict  — {pollutant: sub_index} for all inputs
-        category         : str   — AQI category label
+    Returns dict: aqi, prominent_pollutant, sub_indices, category.
     """
-    sub_indices: dict[str, float] = {}
-
+    sub_indices = {}
     for pollutant, conc in pollutant_concentrations.items():
         si = compute_sub_index(conc, pollutant)
         if si is not None:
@@ -183,22 +117,69 @@ def compute_aqi(pollutant_concentrations: dict[str, float]) -> dict[str, Any]:
 
     prominent = max(sub_indices, key=sub_indices.__getitem__)
     aqi_value = int(round(sub_indices[prominent]))
-
     return {
         "aqi": aqi_value,
-        "prominent_pollutant": prominent.upper(),
+        "prominent_pollutant": _LABELS[prominent],
         "sub_indices": sub_indices,
         "category": aqi_category(aqi_value),
     }
 
 
+def aqi_along_paths(history: np.ndarray, forecast: np.ndarray,
+                    pollutants: tuple = tuple(CPCB_WINDOWS)) -> tuple[np.ndarray, np.ndarray]:
+    """
+    CPCB AQI for each forecast hour of many locations at once.
+
+    history  : (N, 23, 6) observed hourly concentrations for the 23 hours up to issue time
+    forecast : (N, H, 6)  forecast hourly concentrations for t+1..t+H
+    Returns (aqi (N, H) float, prominent (N, H) int index into `pollutants`).
+
+    Each forecast hour's 24h / 8h means mix observed and forecast hours
+    exactly as refresh_aqi() would once those hours are observed.
+    """
+    path = np.concatenate([history, forecast], axis=1)          # (N, 23 + H, 6)
+    csum = np.concatenate([np.zeros_like(path[:, :1]), np.cumsum(path, axis=1)], axis=1)
+    n_hist, H = history.shape[1], forecast.shape[1]
+    end = np.arange(n_hist + 1, n_hist + H + 1)                 # exclusive end index per step
+    subs = []
+    for j, p in enumerate(pollutants):
+        w = CPCB_WINDOWS[p]
+        mean = (csum[:, end, j] - csum[:, end - w, j]) / w      # (N, H)
+        subs.append(cpcb_sub_index(mean, p))
+    subs = np.stack(subs, axis=-1)                              # (N, H, 6)
+    return np.nanmax(subs, axis=-1), np.nanargmax(subs, axis=-1)
+
+
+def cpcb_aqi_frame(hourly: pd.DataFrame) -> pd.DataFrame:
+    """
+    CPCB AQI for every hour of ONE location's hourly concentration series.
+
+    `hourly` must be sorted, hourly, with columns pm25, pm10, no2, so2, co, o3.
+    Rolling windows match refresh_aqi() in SQL: the current hour plus the
+    previous 23 (or 7) hours.
+    """
+    out = pd.DataFrame(index=hourly.index)
+    subs = []
+    for p, w in CPCB_WINDOWS.items():
+        agg = hourly[p].rolling(w, min_periods=1).mean()
+        out[_AGG_NAMES[p]] = agg
+        out[f"sub_index_{p}"] = cpcb_sub_index(agg.values, p)
+        subs.append(out[f"sub_index_{p}"].values)
+    subs = np.vstack(subs)  # (6, T)
+    aqi = np.nanmax(subs, axis=0)
+    out["aqi"] = np.round(aqi).astype(int)
+    labels = np.array([_LABELS[p] for p in CPCB_WINDOWS])
+    out["prominent_pollutant"] = labels[np.nanargmax(subs, axis=0)]
+    out["aqi_category"] = [aqi_category(v) for v in out["aqi"]]
+    return out
+
+
 def aqi_category(aqi: int) -> str:
     """Return the CPCB AQI category label for a given AQI value."""
-    if aqi <= 50:   return "Good"
-    if aqi <= 100:  return "Satisfactory"
-    if aqi <= 200:  return "Moderate"
-    if aqi <= 300:  return "Poor"
-    if aqi <= 400:  return "Very Poor"
+    for upper, label in ((50, "Good"), (100, "Satisfactory"), (200, "Moderate"),
+                         (300, "Poor"), (400, "Very Poor")):
+        if aqi <= upper:
+            return label
     return "Severe"
 
 

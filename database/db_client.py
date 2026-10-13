@@ -1,165 +1,247 @@
-# database/db_client.py
+"""
+database/db_client.py
+---------------------
+Module 3 — Postgres / TimescaleDB access layer.
+
+Writes are bulk upserts via psycopg2 `execute_values` (one round-trip per
+few thousand rows — matters on a serverless DB like Neon). CPCB AQI math
+runs in-database through refresh_aqi() defined in schema.sql.
+"""
+
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
+from psycopg2.extras import execute_values
 from sqlalchemy import create_engine, text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config.settings import DB_URL, DB_URL_SYNC
+from config.settings import DB_URL_SYNC, FORECAST_RETENTION_DAYS, RAW_RETENTION_DAYS
 from exceptions import DatabaseError, HypertableError
 from logger import get_logger
-from utils import location_hash
 
 logger = get_logger(__name__)
 
-_async_engine  = None
-_sync_engine   = None
-_async_session = None
+RAW_COLS = [
+    "timestamp", "location_hash",
+    "temp_c", "humidity_pct", "wind_speed_ms", "wind_dir_deg", "precip_mm",
+    "pressure_hpa", "boundary_layer_m", "radiation_wm2",
+    "pm25", "pm10", "no2", "so2", "co", "o3", "dust", "aod", "pm_gap_filled",
+]
+FORECAST_COLS = [
+    "forecast_generated_at", "forecast_target_time", "location_hash", "hours_ahead",
+    "pm25", "pm10", "no2", "so2", "co", "o3",
+    "aqi", "aqi_lower", "aqi_upper", "aqi_category", "prominent_pollutant",
+    "aqi_lstm", "aqi_gru", "aqi_lgbm", "model_version",
+]
 
-def get_async_engine():
-    global _async_engine
-    if _async_engine is None:
-        _async_engine = create_async_engine(DB_URL, pool_size=10, max_overflow=20, pool_timeout=30, pool_pre_ping=True)
-    return _async_engine
+_sync_engine = None
+
+
+def _normalise_url(url: str) -> str:
+    # Neon / Heroku style URLs use the bare `postgres://` scheme
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    return url.replace("postgresql+asyncpg://", "postgresql://")
+
 
 def get_sync_engine():
     global _sync_engine
     if _sync_engine is None:
-        _sync_engine = create_engine(DB_URL_SYNC, pool_pre_ping=True)
+        _sync_engine = create_engine(_normalise_url(DB_URL_SYNC), pool_pre_ping=True, pool_size=5)
     return _sync_engine
 
-def get_async_session_factory():
-    global _async_session
-    if _async_session is None:
-        _async_session = sessionmaker(get_async_engine(), class_=AsyncSession, expire_on_commit=False)
-    return _async_session
 
-def write_spatial_grid_batch(df: pd.DataFrame) -> int:
-    """
-    Safely uploads a complete chunk block of raw tracking nodes straight into PostGIS.
-    """
-    engine = get_sync_engine()
-    df_out = df.copy().reset_index()
+def _records(df: pd.DataFrame, cols: list[str]) -> list[tuple]:
+    """DataFrame → list of tuples with NaN/NaT → None and numpy scalars → Python."""
+    out = df[cols].astype(object).where(df[cols].notna(), None)
+    return [tuple(v.item() if isinstance(v, np.generic) else v for v in row)
+            for row in out.itertuples(index=False, name=None)]
 
+
+def _bulk_upsert(table: str, cols: list[str], rows: list[tuple], conflict_sql: str) -> int:
+    if not rows:
+        return 0
+    sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES %s {conflict_sql}"
+    raw = get_sync_engine().raw_connection()
     try:
-        with engine.begin() as conn:
-            df_out.to_sql("spatial_grid_staging", conn, if_exists="replace", index=False, chunksize=1000)
-            
-            cols = "timestamp, lat, lon, location_name, location_hash, no2, so2, co, o3, aod, temp_c, humidity_pct, wind_speed_ms, precip_mm, pressure_hpa, boundary_layer_m, pm25_proxy, pm10_proxy"
-            
-            conn.execute(text(f"""
-                INSERT INTO raw_observations ({cols}, geom)
-                SELECT {cols}, ST_SetSRID(ST_MakePoint(lon, lat), 4326)
-                FROM spatial_grid_staging
-                ON CONFLICT (timestamp, location_hash) DO NOTHING;
-            """))
-            conn.execute(text("DROP TABLE IF EXISTS spatial_grid_staging"))
-        return len(df_out)
+        with raw.cursor() as cur:
+            execute_values(cur, sql, rows, page_size=5000)
+        raw.commit()
+        return len(rows)
     except Exception as exc:
-        raise HypertableError(f"Failed to load spatial batch to cluster: {exc}")
+        raw.rollback()
+        raise HypertableError(f"Bulk write to {table} failed: {exc}") from exc
+    finally:
+        raw.close()
 
-def get_nearest_grid_aqi(lat: float, lon: float, radius_meters: float = 60000.0) -> Optional[dict]:
-    """
-    Finds the closest recorded monitoring grid sequence point relative to user location.
-    """
-    engine = get_sync_engine()
-    query = text("""
-        SELECT timestamp, location_name, aqi, prominent_pollutant, aqi_category,
-               pm25_24h_avg, pm10_24h_avg, no2_24h_avg, so2_24h_avg, co_8h_max, o3_8h_max,
-               sub_index_pm25, sub_index_pm10, sub_index_no2, sub_index_so2, sub_index_co, sub_index_o3
-        FROM aqi_computed
-        WHERE ST_DWithin(geom::geography, ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)::geography, :radius)
-        ORDER BY timestamp DESC, ST_Distance(geom, ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)) ASC
-        LIMIT 1;
-    """)
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(query, {"lat": lat, "lon": lon, "radius": radius_meters}).fetchone()
-        return dict(row._mapping) if row else None
-    except Exception as exc:
-        raise DatabaseError(f"Spatial proximity calculation aborted: {exc}")
+
+# ===========================================================================
+# Writes
+# ===========================================================================
+
+def upsert_nodes(nodes: pd.DataFrame) -> int:
+    cols = ["location_hash", "location_name", "state", "lat", "lon", "kind"]
+    n = _bulk_upsert(
+        "grid_nodes", cols, _records(nodes, cols),
+        "ON CONFLICT (location_hash) DO UPDATE SET location_name = EXCLUDED.location_name, "
+        "state = EXCLUDED.state, kind = EXCLUDED.kind",
+    )
+    logger.info("Registered {} grid nodes.", n)
+    return n
+
 
 def write_raw_observations(df: pd.DataFrame) -> int:
-    if "location_hash" not in df.columns:
-        df = df.copy()
-        df["location_hash"] = df.apply(lambda r: location_hash(r["lat"], r["lon"]), axis=1)
-    return write_spatial_grid_batch(df)
+    """
+    Upsert observed hours. CAMS revises recent hours between model runs,
+    so conflicts overwrite rather than skip.
+    """
+    df = df.copy()
+    if "pm_gap_filled" not in df.columns:
+        df["pm_gap_filled"] = False
+    for col in RAW_COLS:
+        if col not in df.columns:
+            df[col] = np.nan
+    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in RAW_COLS[2:])
+    return _bulk_upsert(
+        "raw_observations", RAW_COLS, _records(df, RAW_COLS),
+        f"ON CONFLICT (timestamp, location_hash) DO UPDATE SET {updates}, ingested_at = NOW()",
+    )
 
-def compute_and_store_aqi(location_hash_id: str) -> int:
-    engine = get_sync_engine()
-    try:
-        with engine.begin() as conn:
-            result = conn.execute(text("""
-                INSERT INTO aqi_computed (
-                    timestamp, location_hash, location_name, lat, lon,
-                    pm25_24h_avg, pm10_24h_avg, no2_24h_avg, so2_24h_avg, co_8h_max, o3_8h_max,
-                    sub_index_pm25, sub_index_pm10, sub_index_no2, sub_index_so2, sub_index_co, sub_index_o3,
-                    aqi, prominent_pollutant, aqi_category, computed_at
-                )
-                SELECT timestamp, location_hash, location_name, lat, lon,
-                       pm25_24h_avg, pm10_24h_avg, no2_24h_avg, so2_24h_avg, co_8h_max, o3_8h_max,
-                       sub_index_pm25, sub_index_pm10, sub_index_no2, sub_index_so2, sub_index_co, sub_index_o3,
-                       aqi, prominent_pollutant, aqi_category, NOW()
-                FROM v_aqi_final WHERE location_hash = :loc_hash AND aqi > 0
-                ON CONFLICT (timestamp, location_hash) DO UPDATE SET
-                    aqi=EXCLUDED.aqi, prominent_pollutant=EXCLUDED.prominent_pollutant, aqi_category=EXCLUDED.aqi_category, computed_at=NOW();
-            """), {"loc_hash": location_hash_id})
-            return result.rowcount
-    except Exception as exc:
-        raise DatabaseError(f"AQI computation failed: {exc}")
 
-def get_latest_aqi(lat: float, lon: float) -> Optional[dict]:
-    loc_hash = location_hash(lat, lon)
-    engine = get_sync_engine()
-    query = text("SELECT * FROM aqi_computed WHERE location_hash = :loc_hash ORDER BY timestamp DESC LIMIT 1")
+def refresh_aqi(since: datetime) -> int:
+    """Run the in-database CPCB computation for every node-hour ≥ since."""
     try:
-        with engine.connect() as conn:
-            row = conn.execute(query, {"loc_hash": loc_hash}).fetchone()
-        return dict(row._mapping) if row else None
+        with get_sync_engine().begin() as conn:
+            n = conn.execute(text("SELECT refresh_aqi(:since)"), {"since": since}).scalar()
+        logger.info("refresh_aqi: {} node-hours (re)computed since {}", n, since)
+        return int(n or 0)
     except Exception as exc:
-        raise DatabaseError(f"Failed to pull direct location row: {exc}")
+        raise DatabaseError(f"AQI computation failed: {exc}") from exc
 
-def get_lstm_input_sequence(lat: float, lon: float, lookback_hours: int = 168) -> pd.DataFrame:
-    loc_hash = location_hash(lat, lon)
-    since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    engine = get_sync_engine()
-    query = text("""
-        SELECT a.timestamp, a.aqi, a.pm25_24h_avg, a.pm10_24h_avg, a.no2_24h_avg, a.so2_24h_avg, a.co_8h_max, a.o3_8h_max,
-               r.temp_c, r.humidity_pct, r.wind_speed_ms, r.precip_mm, r.pressure_hpa, r.boundary_layer_m
-        FROM aqi_computed a LEFT JOIN raw_observations r ON a.timestamp = r.timestamp AND a.location_hash = r.location_hash
-        WHERE a.location_hash = :loc_hash AND a.timestamp >= :since ORDER BY a.timestamp ASC
-    """)
-    try:
-        with engine.connect() as conn:
-            df = pd.read_sql(query, conn, params={"loc_hash": loc_hash, "since": since}, index_col="timestamp", parse_dates=["timestamp"])
-        if not df.empty:
-            df['hour_of_day'] = df.index.hour
-            df['day_of_week'] = df.index.dayofweek
-            df['is_weekend']  = df.index.dayofweek.isin([5, 6]).astype(int)
-            df['temp_change_6h'] = df['temp_c'].diff(6).fillna(0)
-            df['pm25_change_3h'] = df['pm25_24h_avg'].diff(3).fillna(0)
-        return df
-    except Exception as exc:
-        raise DatabaseError(f"Failed to fetch sequence block: {exc}")
 
-def write_forecast(forecast_df: pd.DataFrame, lat: float, lon: float, location_name: str, model_version: str = "1.0.0") -> int:
-    loc_hash = location_hash(lat, lon)
-    engine = get_sync_engine()
-    df_out = forecast_df.copy()
-    df_out["forecast_generated_at"] = datetime.now(timezone.utc)
-    df_out["location_hash"] = loc_hash
-    df_out["location_name"] = location_name
-    df_out["lat"], df_out["lon"] = lat, lon
-    df_out["model_version"], df_out["lookback_hours_used"] = model_version, 168
+def write_forecasts(df: pd.DataFrame) -> int:
+    return _bulk_upsert(
+        "aqi_forecasts", FORECAST_COLS, _records(df, FORECAST_COLS),
+        "ON CONFLICT (forecast_generated_at, forecast_target_time, location_hash) DO NOTHING",
+    )
+
+
+def register_model(card: dict) -> None:
+    """Upsert the deployed model card so serving layers (Vercel) can show its metrics."""
+    import json
+
+    if not card:
+        return
+    with get_sync_engine().begin() as conn:
+        conn.execute(text("""
+            INSERT INTO model_registry (model_version, card) VALUES (:v, CAST(:c AS JSONB))
+            ON CONFLICT (model_version) DO UPDATE SET card = EXCLUDED.card, last_used_at = NOW()
+        """), {"v": card.get("model_version", "unknown"), "c": json.dumps(card)})
+
+
+def evaluate_forecast_skill() -> int:
+    with get_sync_engine().begin() as conn:
+        n = conn.execute(text("SELECT evaluate_forecast_skill()")).scalar()
+    logger.info("Live skill: {} (run, horizon) rows scored.", n)
+    return int(n or 0)
+
+
+def prune(raw_days: int = RAW_RETENTION_DAYS, forecast_days: int = FORECAST_RETENTION_DAYS) -> None:
+    """Retention that works without Timescale policies (keeps Neon under its free storage cap)."""
+    now = datetime.now(timezone.utc)
+    with get_sync_engine().begin() as conn:
+        r = conn.execute(text("DELETE FROM raw_observations WHERE timestamp < :t"),
+                         {"t": now - timedelta(days=raw_days)}).rowcount
+        a = conn.execute(text("DELETE FROM aqi_computed WHERE timestamp < :t"),
+                         {"t": now - timedelta(days=raw_days)}).rowcount
+        f = conn.execute(text("DELETE FROM aqi_forecasts WHERE forecast_generated_at < :t"),
+                         {"t": now - timedelta(days=forecast_days)}).rowcount
+    logger.info("Pruned {} raw, {} aqi, {} forecast rows.", r, a, f)
+
+
+# ===========================================================================
+# Reads
+# ===========================================================================
+
+def _read(sql: str, **params) -> pd.DataFrame:
     try:
-        with engine.begin() as conn:
-            df_out.to_sql("aqi_forecasts", conn, if_exists="append", index=False, chunksize=24)
-        return len(df_out)
+        with get_sync_engine().connect() as conn:
+            return pd.read_sql(text(sql), conn, params=params)
     except Exception as exc:
-        raise HypertableError(f"Forecast storage aborted: {exc}")
+        raise DatabaseError(f"Query failed: {exc}") from exc
+
+
+def load_nodes() -> pd.DataFrame:
+    return _read("SELECT location_hash, location_name, state, lat, lon, kind FROM grid_nodes")
+
+
+def nearest_node(lat: float, lon: float, max_km: float = 150.0) -> Optional[dict]:
+    """Closest tracked node (equirectangular distance — plenty for ~1k nodes)."""
+    df = _read("""
+        SELECT location_hash, location_name, state, lat, lon, kind,
+               111.32 * SQRT(POWER(lat - :lat, 2)
+                             + POWER((lon - :lon) * COS(RADIANS(:lat)), 2)) AS distance_km
+        FROM grid_nodes
+        ORDER BY distance_km
+        LIMIT 1
+    """, lat=lat, lon=lon)
+    if df.empty or df["distance_km"].iat[0] > max_km:
+        return None
+    return df.iloc[0].to_dict()
+
+
+def latest_aqi_all() -> pd.DataFrame:
+    return _read("SELECT * FROM v_latest_aqi")
+
+
+def latest_aqi(location_hash: str) -> Optional[dict]:
+    df = _read("SELECT * FROM v_latest_aqi WHERE location_hash = :h", h=location_hash)
+    return None if df.empty else df.iloc[0].to_dict()
+
+
+def latest_forecast(location_hash: str) -> pd.DataFrame:
+    return _read("""
+        SELECT * FROM v_latest_forecast WHERE location_hash = :h ORDER BY forecast_target_time
+    """, h=location_hash)
+
+
+def aqi_history(location_hash: str, hours: int = 72) -> pd.DataFrame:
+    return _read("""
+        SELECT timestamp, aqi, aqi_category, pm25_24h_avg, pm10_24h_avg
+        FROM aqi_computed
+        WHERE location_hash = :h AND timestamp >= NOW() - make_interval(hours => :hours)
+        ORDER BY timestamp
+    """, h=location_hash, hours=hours)
+
+
+def skill_summary(days: int = 7) -> pd.DataFrame:
+    """Live skill per horizon, averaged over runs issued in the last `days` days."""
+    return _read("""
+        SELECT hours_ahead,
+               SUM(n_nodes)                                         AS n,
+               SUM(aqi_mae * n_nodes) / NULLIF(SUM(n_nodes), 0)     AS aqi_mae,
+               SUM(persistence_aqi_mae * n_nodes) / NULLIF(SUM(n_nodes), 0) AS persistence_aqi_mae,
+               SUM(category_accuracy * n_nodes) / NULLIF(SUM(n_nodes), 0)   AS category_accuracy
+        FROM forecast_skill
+        WHERE forecast_generated_at >= NOW() - make_interval(days => :days)
+        GROUP BY hours_ahead
+        ORDER BY hours_ahead
+    """, days=days)
+
+
+def load_observations(days: int, location_hashes: Optional[list[str]] = None) -> pd.DataFrame:
+    """Hourly raw observations for training / inference, long format."""
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    sql = "SELECT * FROM raw_observations WHERE timestamp >= :since"
+    params: dict = {"since": since}
+    if location_hashes:
+        sql += " AND location_hash = ANY(:hashes)"
+        params["hashes"] = list(location_hashes)
+    df = _read(sql + " ORDER BY location_hash, timestamp", **params)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    return df

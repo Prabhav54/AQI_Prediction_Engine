@@ -1,0 +1,47 @@
+name: Pan-India pipeline
+
+# Ingest ~386 nodes from Open-Meteo, write CPCB AQI, run the ensemble,
+# score elapsed forecasts and prune old rows. Every 3 hours: CAMS itself
+# updates twice a day and this cadence keeps us inside the free API quota
+# (386 nodes × 2 endpoints × 8 runs ≈ 6.2k of 10k calls/day).
+on:
+  schedule:
+    - cron: "15 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      setup_db:
+        description: "Apply schema before running (first deploy)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: pipeline
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL }}
+      LOG_LEVEL: INFO
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-pipeline.txt
+
+      - name: Apply schema
+        if: ${{ inputs.setup_db }}
+        run: python database/setup_db.py
+
+      - name: Ingest → forecast → skill → prune
+        run: python run_pipeline.py all

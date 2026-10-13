@@ -1,71 +1,168 @@
 # Pan-India AI Air Quality Forecasting Platform 🌍💨
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.104.1-009688.svg?logo=fastapi)](https://fastapi.tiangolo.com/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.1.0-EE4C2C.svg?logo=pytorch)](https://pytorch.org/)
-[![TimescaleDB](https://img.shields.io/badge/TimescaleDB-PostgreSQL-FDB515.svg?logo=postgresql)](https://www.timescale.com/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-1.28.0-FF4B4B.svg?logo=streamlit)](https://streamlit.io/)
+[![CI](https://github.com/Prabhav54/AQI_Prediction_Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Prabhav54/AQI_Prediction_Engine/actions/workflows/ci.yml)
+[![Pipeline](https://github.com/Prabhav54/AQI_Prediction_Engine/actions/workflows/pipeline.yml/badge.svg)](https://github.com/Prabhav54/AQI_Prediction_Engine/actions/workflows/pipeline.yml)
+[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-LSTM%20%2B%20GRU-EE4C2C.svg?logo=pytorch)](https://pytorch.org/)
+[![TimescaleDB](https://img.shields.io/badge/TimescaleDB%20%2F%20Postgres-FDB515.svg?logo=postgresql)](https://www.timescale.com/)
 
-An end-to-end, fault-tolerant Machine Learning pipeline and real-time dashboard that predicts Air Quality Index (AQI) and specific pollutant concentrations ($PM_{2.5}$, $PM_{10}$, $NO_{2}$, $SO_{2}$, $CO$, $O_{3}$) up to 24 hours in advance across 50 major Indian cities. 
+**Live dashboard:** https://pan-india-aqi.vercel.app
 
-This engine replaces slow satellite imagery processing with a high-speed, ground-truth API architecture, leveraging a dynamic deep learning ensemble (LightGBM + PyTorch LSTM/GRU) to achieve **87% forecasting accuracy** with sub-200ms database query latency.
+> **Status (2026-10-14):** the dashboard is deployed and serves a bundled snapshot of a full 386-node forecast run (`web/public/snapshot.json`). Live, 3-hourly updates switch on automatically once the Neon database is attached (see [Production](#production-github-actions--neon--vercel)). Until then, a banner on the page shows the snapshot time.
 
----
+Forecasts the CPCB **Air Quality Index and all six regulated pollutants** (PM2.5, PM10, NO₂, SO₂, CO, O₃) **24 hours ahead, hour by hour, across the whole of India**. It covers 386 nodes: all 112 state capitals and million-plus cities, plus a 1° grid clipped to India's borders. A 0.5° grid (1,202 nodes) is a config switch.
 
-## 🚀 Key Features & Engineering Impact
-
-* **Asynchronous, Fault-Tolerant ETL Pipeline:** Engineered an automated data ingestion system using Python and `tenacity` (exponential backoff) to fetch hourly weather and ground-level pollution data from the Open-Meteo API. Successfully handles network drops and rate limits to guarantee 100% daily data delivery for 50 diverse geographic locations.
-* **Optimized Database Compute (TimescaleDB):** Shifted heavy CPCB (Central Pollution Control Board) mathematical compliance logic directly into the database layer. Utilized advanced SQL window functions (24-hour rolling averages and 8-hour maxima) paired with Continuous Aggregates to reduce UI query latency to **under 200ms**.
-* **Dynamic AI Forecasting Ensemble:** Architected a hybrid forecasting engine that blends:
-  * **PyTorch (LSTM & GRU):** For capturing continuous physical momentum across 168-hour historical lag sequences.
-  * **LightGBM:** For rapid, non-linear pattern recognition on engineered temporal features (e.g., `hour_of_day`, `is_weekend` to implicitly model traffic spikes).
-* **Automated MLOps:** Integrated with GitHub Actions and Docker/Render for continuous, zero-touch hourly ingestion and API serving.
-* **Interactive UI:** A responsive Streamlit dashboard for real-time visualization and early air quality warnings.
+A single **global** LSTM + GRU + LightGBM ensemble is trained across every node. It reads the last 168 hours at a node together with the next 24 hours of forecast weather. It predicts each pollutant's change from now, and CPCB AQI is then computed along the path of observed history plus forecast, exactly as the database computes it from observations.
 
 ---
 
-## 🏗️ System Architecture
+## Results (held-out test, never seen in training or model selection)
+
+Test window 2026-09-06 → 2026-10-12 (11,200 node × issue-time forecasts, 24 hourly steps each). The model was trained on 80 nodes covering Oct 2025 → Aug 2026 and is model version `2026.10.13-5f7e142`.
+
+| Model | AQI MAE | AQI RMSE | Category hit | Skill vs persistence |
+|---|---:|---:|---:|---:|
+| Persistence | 39.0 | 57.1 | 54.7% | — |
+| Seasonal-naive (same hour yesterday) | 16.6 | 29.2 | 78.4% | +57.5% |
+| LSTM | 14.0 | 25.5 | 82.4% | +64.0% |
+| GRU | 13.3 | 23.6 | 83.2% | +66.0% |
+| LightGBM | 12.1 | 22.4 | 84.4% | +69.0% |
+| **Ensemble** | **11.7** | **21.7** | **84.8%** | **+69.9%** |
+
+| Pollutant (24h-ahead hourly) | PM2.5 | PM10 | NO₂ | SO₂ | CO | O₃ |
+|---|---:|---:|---:|---:|---:|---:|
+| Ensemble MAE (µg/m³; CO mg/m³) | 8.4 | 20.0 | 3.8 | 3.5 | 0.07 | 11.9 |
+| Skill vs persistence | +35% | +25% | +68% | +37% | +51% | +75% |
+
+* The ensemble beats its best single member (LightGBM) with Wilcoxon signed-rank p ≈ 1e-47.
+* The 80% AQI prediction interval covers **86.8%** of test outcomes (the target is 80%).
+* AQI MAE grows from 0.4 at +1h to 18.7 at +24h. Persistence reaches 60 by +15h.
+* **Skill** = reduction in AQI MAE versus persistence ("the next 24h look like now"), averaged over every horizon from 1 to 24h and every node.
+* **Category hit** = the share of forecasts that land in the correct CPCB band (Good … Severe).
+* All figures come from `forecasting/checkpoints/model_card.json`, which every training run writes. Live skill of deployed forecasts is scored in-database every run (`forecast_skill` table) and shown on the dashboard.
+
+---
+
+## Architecture
+
 ```text
-AQI_Prediction_Engine/
-├── .github/workflows/
-│   └── ingest.yml              # GitHub Actions cron job for hourly cloud automation
-├── api/
-│   ├── routes/                 # FastAPI endpoints (e.g., forecast.py, ingest.py)
-│   └── main.py                 # FastAPI application instance and server config
-├── config/
-│   └── settings.py             # Global constants, DB URIs, and configuration
-├── database/
-│   └── db_client.py            # TimescaleDB connection and advanced SQL window functions
-├── forecasting/
-│   ├── train.py                # Ensemble optimization, backtesting, and training loop
-│   └── weights/                # Serialized PyTorch (.pt) and LightGBM (.joblib) models
-├── ingestion/
-│   ├── geocoder.py             # Coordinate resolution
-│   └── weather_client.py       # Open-Meteo API wrapper with exponential backoff (tenacity)
-├── app.py                      # Streamlit real-time interactive dashboard
-├── run_ingestion.py            # Main automation script orchestrating the 50-city ETL pipeline
-├── auto_ingest.bat             # Windows Task Scheduler batch executable (for local cron)
-├── requirements.txt            # Python dependencies
-└── README.md
-1. **Ingestion Worker (Cron):** An automated Python script runs hourly, geocoding 50 Indian cities, calculating secure MD5 location hashes, and pulling ground-truth CAMS-calibrated data from Open-Meteo.
-2. **Time-Series Database (TimescaleDB):** Data is stored in time-partitioned hypertables. Materialized views automatically compute CPCB-compliant rolling averages in the background.
-3. **Machine Learning API (FastAPI):** Exposes REST endpoints to trigger the ETL, load the latest `.joblib` and `.pt` model weights, and serve the 24-hour predictions.
-4. **Frontend (Streamlit):** Queries the FastAPI backend to render real-time gauges, pollutant breakdowns, and forecasting trendlines.
+             ┌──────────────── GitHub Actions (every 3 h) ─────────────────┐
+Open-Meteo   │  ingest            CPCB math (SQL)       ensemble inference │      Vercel
+ weather  ──►│  386 nodes in ──►  refresh_aqi():   ──►  LSTM + GRU + LGBM  │──►  Neon Postgres ──► /api (FastAPI, read-only)
+ CAMS AQ     │  8 batched calls   24h/8h windows,       all nodes in one   │                         + Leaflet dashboard
+             │  (quota-throttled) sub-indices, AQI      batch, 80% bands   │
+             └──────────────────────────────────────────────────────────────┘
+             ┌──────────── GitHub Actions (weekly) ────────────┐
+             │ backfill 180d → retrain → champion/challenger → │──► commits promoted checkpoints
+             └─────────────────────────────────────────────────┘
 ```
+
+| Layer | What it does | Where |
+|---|---|---|
+| **Ingestion** | Batched multi-location Open-Meteo requests (50 nodes per HTTP call). Weighted per-minute and per-hour quota throttle. `tenacity` exponential backoff on 429/5xx. A failed batch is skipped, not fatal. | `ingestion/weather_client.py`, `ingestion/pipeline.py` |
+| **Node set** | India-clipped lattice generated once with GeoPandas and committed as CSV, so the cron job needs no GIS stack. City nodes override grid nodes within 25 km. | `ingestion/grid_generator.py`, `config/cities.py` |
+| **Storage + CPCB math** | Portable schema: plain Postgres (Neon), upgraded automatically on TimescaleDB with hypertables, compression and a continuous aggregate. CPCB sub-indices and AQI are SQL functions. A Python mirror for forecast hours is tested against the SQL output. | `database/schema.sql` |
+| **Forecasting** | Global multi-horizon ensemble: patched LSTM/GRU encoders with known future covariates (MQ-RNN style), plus a horizon-stacked LightGBM per pollutant. Per-pollutant blend weights are tuned on validation. | `forecasting/` |
+| **Uncertainty** | 80% intervals from validation residual quantiles per horizon and pollutant (split-conformal), with test coverage reported. | `forecasting/evaluation.py` |
+| **MLOps** | Hourly-class batch inference, in-database live skill scoring, a weekly retrain with a champion/challenger gate, and versioned model cards in a `model_registry` table. | `.github/workflows/`, `run_pipeline.py` |
+| **Serving** | Vercel serverless API (two dependencies, edge-cached) and a Leaflet/Chart.js dashboard. If the DB is unreachable it falls back to a bundled snapshot. | `web/` |
+| **Local stack** | FastAPI + Streamlit + TimescaleDB via Docker Compose. | `api/`, `ui/`, `docker-compose.yml` |
+
+### Why these modelling choices
+
+* **Predict the change, not the level.** Targets are `log1p(y[t+h]) − log1p(y[t])`, scaled per horizon. Persistence becomes the zero baseline, and the log scale tames dust-storm and stubble-burning spikes. The loss is Huber.
+* **Use forecast weather.** Tomorrow's PM depends mostly on tomorrow's boundary-layer height, wind and rain. The old model held weather constant for 24h; this one feeds the next-24h weather forecast directly into the decoder.
+* **Direct multi-horizon, not autoregressive.** All 24 steps come from one forward pass, so errors don't compound.
+* **Forecast pollutants, then derive AQI.** AQI is a 24h/8h rolling mean, so the CPCB math is applied to observed history plus forecast. The forecast AQI is therefore exactly the number CPCB will publish when those hours are observed.
+* **One global model.** Training on nodes from every climate zone (80 nodes for the current checkpoint, 140+ in the weekly retrain) lets the model forecast rural grid nodes that have no history of their own in the training data.
+* **Patching.** Every 4 hours are concatenated into one encoder step (PatchTST). The RNN still sees all 168 hours but trains about 50× faster on CPU, which is what makes weekly retraining in free CI possible.
+
 ---
-## 🛠️ Technology Stack
 
-* **Backend & API:** Python 3.10, FastAPI, Uvicorn, Pydantic
-* **AI / Machine Learning:** PyTorch (Deep Learning RNNs), LightGBM (Gradient Boosting), Scikit-Learn, Pandas, NumPy
-* **Database / Storage:** PostgreSQL, TimescaleDB, Joblib (Model State)
-* **MLOps & Resilience:** Docker, GitHub Actions, `tenacity` (Retry Logic), Windows Task Scheduler
-* **Frontend:** Streamlit, Plotly
+## Repository layout
+
+```text
+.github/workflows/  ci.yml · pipeline.yml (3-hourly) · retrain.yml (weekly)
+api/                FastAPI backend for local / Docker use
+config/             settings.py · cities.py (112 city nodes)
+database/           schema.sql (tables, CPCB SQL functions, views) · setup_db.py · db_client.py
+forecasting/        dataset.py · model.py · ensemble.py · train.py · evaluation.py · checkpoints/
+ingestion/          weather_client.py · pipeline.py · grid_generator.py · nodes/*.csv · geocoder.py · gee_client.py
+proxy_model/        XGBoost AOD→PM gap-filler (only fills hours where CAMS PM is missing)
+ui/app.py           Streamlit dashboard
+web/                Vercel deployment: api/index.py (FastAPI) + public/index.html, public/snapshot.json
+run_pipeline.py     all | ingest | forecast | skill | prune | backfill | export-snapshot
+```
 
 ---
 
-## ⚙️ Local Installation & Setup
+## Running it
 
-### 1. Clone the Repository
+### Local (conda / venv)
+
 ```bash
-git clone [https://github.com/Prabhav54/AQI_Prediction_Engine.git](https://github.com/Prabhav54/AQI_Prediction_Engine.git)
-cd AQI_Prediction_Engine
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+
+# Postgres or TimescaleDB on localhost (or: docker compose up -d db)
+export DATABASE_URL_SYNC=postgresql://aq_user:aq_pass@localhost:5432/air_quality_db
+python database/setup_db.py              # schema + 386 nodes (idempotent)
+
+python run_pipeline.py all               # ingest → forecast → skill → prune
+uvicorn api.main:app --reload            # http://localhost:8000/docs
+streamlit run ui/app.py                  # http://localhost:8501
+```
+
+### Docker
+
+```bash
+docker compose up -d                     # TimescaleDB + schema + API + Streamlit
+docker compose run --rm pipeline         # one pipeline pass
+```
+
+### Retraining
+
+```bash
+# resumable: finished batches are kept in data/history_parts/ if the run is interrupted
+python run_pipeline.py backfill --start 2025-10-01 --end 2026-10-12 --grid-stride 10 --out data/history.parquet
+python forecasting/train.py --source parquet --data data/history.parquet            # writes checkpoints + model card
+python forecasting/train.py --source parquet --data data/history.parquet --promote-if-better
+```
+
+Training on a CPU laptop takes about 30 minutes: LSTM and GRU with early stopping, LightGBM, blend-weight search, then test evaluation.
+
+### Refreshing the bundled dashboard snapshot
+
+```bash
+python run_pipeline.py all
+python run_pipeline.py export-snapshot --out web/public/snapshot.json
+cd web && vercel deploy --prod
+```
+
+### Production (GitHub Actions + Neon + Vercel)
+
+The Vercel project `pan-india-aqi` deploys from `web/`. Vercel detects the FastAPI preset: `web/api/index.py` serves `/api/*`, and `web/public/` holds the static dashboard and snapshot.
+
+1. In the Vercel project, open **Storage** and add **Neon** from the Marketplace. This injects `DATABASE_URL`. Redeploy so the API picks it up.
+2. Copy that connection string into the GitHub repo secret **`DATABASE_URL`** (Settings → Secrets and variables → Actions).
+3. Merge this branch into `main`, because scheduled workflows only run from the default branch.
+4. Run the **Pan-India pipeline** workflow once with **setup_db = true**. This creates the schema and the 386 nodes, then ingests and forecasts. After that, the cron keeps it fresh every 3 hours, and the dashboard reads live data instead of the snapshot.
+
+The cadence is deliberate. CAMS updates twice a day, and 386 nodes × 2 endpoints × 8 runs ≈ 6.2k calls/day fits Open-Meteo's free 10k/day quota.
+
+---
+
+## Data sources and honest caveats
+
+* **Pollutants:** Copernicus CAMS global atmospheric composition forecasts (~45 km) via the Open-Meteo Air Quality API. **These are model fields, not station measurements.** The forecaster learns to predict CAMS' future values, so its error is relative to CAMS and not to CPCB monitors.
+* **CAMS ozone is biased high over coastal and peninsular India.** For example, Mumbai's 8-hour O₃ often exceeds 200 µg/m³ in CAMS, far above typical CPCB station readings. This frequently makes O₃ the "prominent pollutant". The dashboard shows the prominent pollutant so this stays visible. Fixing it properly needs station data (see the roadmap).
+* **Weather:** the Open-Meteo forecast API for live runs and the historical-forecast archive for training. Training uses archived short-lead forecasts as "future weather", which are slightly better than true 24h-lead forecasts, so live skill can be a little lower than offline skill. `forecast_skill` measures exactly that gap.
+* **Google Earth Engine** (`ingestion/gee_client.py`, Sentinel-5P / MODIS) remains as an optional research path. Satellite overpasses are daily and cloud-gapped, so the hourly pipeline uses Open-Meteo.
+
+## Roadmap
+
+* Bias-correct against CPCB / OpenAQ station observations, so that CAMS becomes a feature and a baseline instead of the target.
+* A Temporal Fusion Transformer member with native quantile outputs.
+* Rolling-origin backtests across all seasons (Diwali, stubble burning, monsoon) instead of a single test window.
+* Report live skill (`forecast_skill`) next to offline test skill after two weeks of live runs, and explain the gap between them.
+* Retrain on the full node set (140+ nodes from the complete backfill) instead of the current 80.

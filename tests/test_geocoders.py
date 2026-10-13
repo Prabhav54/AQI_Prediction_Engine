@@ -12,7 +12,6 @@ import pandas as pd
 from unittest.mock import patch, MagicMock
 
 from ingestion.geocoder import geocode, GeoLocation, _is_within_india
-from ingestion.weather_client import _parse_hourly_response
 
 
 # ===========================================================================
@@ -101,53 +100,6 @@ class TestGeocode:
 
 
 # ===========================================================================
-# Weather client tests
-# ===========================================================================
-
-class TestParseHourlyResponse:
-    """Tests the internal JSON→DataFrame parser."""
-
-    _sample_payload = {
-        "hourly": {
-            "time": [
-                "2024-01-01T00:00", "2024-01-01T01:00", "2024-01-01T02:00"
-            ],
-            "temperature_2m":       [22.5, 23.1, 21.8],
-            "relative_humidity_2m": [60.0, 62.0, 65.0],
-            "wind_speed_10m":       [10.8, 7.2, 14.4],  # km/h → 3.0, 2.0, 4.0 m/s
-            "precipitation":        [0.0, 0.0, 0.2],
-            "surface_pressure":     [1013.0, 1012.5, 1012.0],
-        }
-    }
-
-    def test_parse_returns_dataframe(self):
-        df = _parse_hourly_response(self._sample_payload)
-        assert isinstance(df, pd.DataFrame)
-        assert len(df) == 3
-
-    def test_columns_renamed(self):
-        df = _parse_hourly_response(self._sample_payload)
-        assert "temp_c" in df.columns
-        assert "humidity_pct" in df.columns
-        assert "wind_speed_ms" in df.columns
-        assert "temperature_2m" not in df.columns
-
-    def test_wind_converted_to_ms(self):
-        df = _parse_hourly_response(self._sample_payload)
-        # 10.8 km/h ÷ 3.6 = 3.0 m/s
-        assert abs(df["wind_speed_ms"].iloc[0] - 3.0) < 1e-4
-
-    def test_index_is_utc_datetime(self):
-        df = _parse_hourly_response(self._sample_payload)
-        assert hasattr(df.index, "tz")
-        assert str(df.index.tz) == "UTC"
-
-    def test_missing_hourly_block_raises(self):
-        with pytest.raises(ValueError, match="missing 'hourly' block"):
-            _parse_hourly_response({"latitude": 18.5, "longitude": 73.8})
-
-
-# ===========================================================================
 # Mock satellite + pipeline smoke test
 # ===========================================================================
 
@@ -170,12 +122,3 @@ class TestMockSatellite:
         assert df["no2"].dropna().gt(0).all(), "NO₂ should be positive"
         assert df["aod"].dropna().between(0.0, 1.0).mean() > 0.9, \
             "AOD should mostly be in [0, 1]"
-
-
-@pytest.mark.skip(reason="Requires GEE credentials and network. Run manually.")
-class TestPipelineLive:
-    def test_pipeline_delhi(self):
-        from ingestion.pipeline import run_ingestion_pipeline
-        geo, df = run_ingestion_pipeline("New Delhi", use_mock_satellite=True)
-        assert abs(geo.lat - 28.6) < 1.0
-        assert not df.empty

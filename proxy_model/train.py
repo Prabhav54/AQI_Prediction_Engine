@@ -29,9 +29,9 @@ If the user passes --from-csv we skip the DB and read directly from a CSV
 Usage
 -----
   conda activate aq_engine
-  python proxy_model/train.py --location "Delhi"
+  python proxy_model/train.py --from-parquet data/history.parquet
+  python proxy_model/train.py --from-db --days 90
   python proxy_model/train.py --from-csv data/cpcb_history.csv
-  python proxy_model/train.py --location "Delhi" --tune    # hyperparameter search
 """
 
 import argparse
@@ -123,13 +123,18 @@ def load_training_data_from_csv(csv_path: str) -> pd.DataFrame:
     return df
 
 
-def load_training_data_from_db(lat: float, lon: float, days: int = 365) -> pd.DataFrame:
-    """Pull training rows from TimescaleDB (Module 3)."""
-    from database.db_client import get_proxy_training_data  # lazy import
-    logger.info("Pulling {} days of training data for ({:.4f}, {:.4f})", days, lat, lon)
-    df = get_proxy_training_data(lat=lat, lon=lon, days=days)
-    df = _add_time_features(df)
-    return df
+def load_training_data_from_db(days: int = 90) -> pd.DataFrame:
+    """Pull pan-India AOD + weather + PM rows from the database (Module 3)."""
+    from database.db_client import load_observations  # lazy import
+    logger.info("Pulling {} days of pan-India training data from the DB", days)
+    df = load_observations(days=days)
+    return _add_time_features(df)
+
+
+def load_training_data_from_parquet(path: str) -> pd.DataFrame:
+    """Use the backfilled history written by `run_pipeline.py backfill`."""
+    logger.info("Loading training data from parquet: {}", path)
+    return _add_time_features(pd.read_parquet(path))
 
 
 # ===========================================================================
@@ -161,7 +166,7 @@ def preprocess(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, St
     # ------------------------------------------------
 
     df = df.dropna(subset=must_have).copy()
-    
+
     logger.info("Dropped {} rows missing AOD or ground-truth", before - len(df))
 
     # Fill weather gaps with reasonable defaults (same logic as predict.py)
@@ -253,7 +258,7 @@ def run_training(df: pd.DataFrame, do_cv: bool = False) -> None:
     joblib.dump(scaler,     SCALER_PATH)
 
     logger.info("Artifacts saved to {}", ARTIFACTS_DIR)
-    print(f"\n✅ Saved:")
+    print("\n✅ Saved:")
     print(f"   • {PM25_MODEL_PATH}")
     print(f"   • {PM10_MODEL_PATH}")
     print(f"   • {SCALER_PATH}\n")
@@ -268,22 +273,24 @@ if __name__ == "__main__":
         description="Train the XGBoost PM2.5/PM10 proxy models."
     )
     src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--location", type=str,
-                     help="Pull training data from DB for this city.")
+    src.add_argument("--from-db", action="store_true",
+                     help="Pull pan-India training data from the database.")
+    src.add_argument("--from-parquet", type=str,
+                     help="Path to backfilled history (data/history.parquet).")
     src.add_argument("--from-csv", type=str,
                      help="Path to a CSV with AOD + weather + ground-truth PM.")
-    parser.add_argument("--days", type=int, default=365,
-                        help="Days of history to pull from DB (default: 365).")
+    parser.add_argument("--days", type=int, default=90,
+                        help="Days of history to pull from DB (default: 90).")
     parser.add_argument("--cv", action="store_true",
                         help="Run 5-fold cross-validation before final training.")
     args = parser.parse_args()
 
     if args.from_csv:
         df = load_training_data_from_csv(args.from_csv)
+    elif args.from_parquet:
+        df = load_training_data_from_parquet(args.from_parquet)
     else:
-        from ingestion.geocoder import geocode
-        geo = geocode(args.location)
-        df = load_training_data_from_db(lat=geo.lat, lon=geo.lon, days=args.days)
+        df = load_training_data_from_db(days=args.days)
 
     if df.empty:
         logger.error("No training data available — aborting.")

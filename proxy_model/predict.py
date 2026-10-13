@@ -209,3 +209,45 @@ def run_proxy_inference(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     return df
+
+
+def fill_pm_gaps(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Gap-filler used by the ingestion pipeline.
+
+    CAMS PM2.5/PM10 from Open-Meteo is the primary source. Only hours where
+    CAMS PM is missing but satellite AOD + weather are present get a proxy
+    estimate; those rows are flagged pm_gap_filled=True so they can be
+    excluded from training targets. Never overwrites real CAMS values.
+
+    `df` is the long ingestion frame (timestamp column, many locations).
+    If the proxy artifacts aren't trained, rows are returned unchanged.
+    """
+    df = df.copy()
+    df["pm_gap_filled"] = False
+    gaps = df["pm25"].isna() | df["pm10"].isna()
+    if not gaps.any():
+        return df
+
+    try:
+        pm25_model, pm10_model, scaler = _load_artifacts()
+    except ModelNotFoundError:
+        logger.warning("{} rows lack CAMS PM and no proxy model is trained — left as NaN.",
+                       int(gaps.sum()))
+        return df
+
+    sub = df.loc[gaps].set_index(pd.DatetimeIndex(df.loc[gaps, "timestamp"]))
+    sub = _fill_missing_features(_add_time_features(sub))
+    ok = sub[FEATURE_COLS].notna().all(axis=1).values
+    if not ok.any():
+        return df
+
+    X = scaler.transform(sub.loc[ok, FEATURE_COLS].values)
+    idx = df.index[gaps][ok]
+    df.loc[idx, "pm25"] = df.loc[idx, "pm25"].fillna(
+        pd.Series(pm25_model.predict(X).clip(0, 500), index=idx))
+    df.loc[idx, "pm10"] = df.loc[idx, "pm10"].fillna(
+        pd.Series(pm10_model.predict(X).clip(0, 700), index=idx))
+    df.loc[idx, "pm_gap_filled"] = True
+    logger.info("Proxy model gap-filled PM for {} node-hours.", len(idx))
+    return df

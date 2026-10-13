@@ -1,27 +1,22 @@
 """
 forecasting/ensemble.py
 -----------------------
-Module 4 — LSTM + GRU + XGBoost AQI Forecast Ensemble.
+Module 4 — LSTM + GRU + LightGBM forecast ensemble (batch inference).
 
-Replaces the old stub that returned random numbers.  This module:
+  1. Loads the LSTM and GRU checkpoints and the LightGBM forecaster
+     (one model per pollutant, horizon as a feature).
+  2. Predicts 24h × 6 pollutant log-changes for every node in one batch.
+  3. Blends members with per-pollutant weights found on the validation
+     split (checkpoints/ensemble_weights.json — rewritten by every retrain).
+  4. Adds 80% intervals from validation residual quantiles (split-conformal).
+  5. Converts the forecast concentrations to CPCB AQI along the path
+     [last 23 observed hours + forecast], exactly as refresh_aqi() would.
 
-  1. Loads the LSTM and GRU checkpoints (forecasting/checkpoints/).
-  2. Loads the XGBoost forecaster artifact (forecasting/checkpoints/
-     xgb_forecaster.joblib) trained alongside the neural nets.
-  3. Generates a 24-hour autoregressive forecast from each model.
-  4. Blends them using validation-tuned weights (default: 0.45 LSTM,
-     0.30 GRU, 0.25 XGBoost — overridden by checkpoints/ensemble_weights.json
-     if present).
-
-Weights live in JSON, not hard-coded, so retraining can update them
-without touching code.
-
-Output format mirrors what api/routes/forecast.py already expects, so the
-FastAPI / Streamlit layers don't need any change.
+Members that are missing are skipped and the weights renormalised.
 """
 
 import json
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Optional
 
 import joblib
@@ -29,205 +24,190 @@ import numpy as np
 import pandas as pd
 import torch
 
-from config.settings import FORECAST_HOURS, LSTM_LOOKBACK_HOURS
+from config.settings import POLLUTANTS
 from exceptions import CheckpointNotFoundError
-from forecasting.dataset import LSTM_FEATURE_COLS
-from forecasting.model import (
-    AQIForecastGRU,
-    AQIForecastLSTM,
-    load_checkpoint,
+from forecasting.dataset import (
+    HORIZON,
+    FeatureSpec,
+    build_store,
+    history_conc,
+    last_log,
+    lgbm_features,
+    nn_batch,
+    normalise_store,
 )
+from forecasting.model import CHECKPOINT_DIR, artifact_paths, load_checkpoint, load_spec
 from logger import get_logger
-from utils import aqi_category
+from utils import aqi_along_paths, aqi_category
 
 logger = get_logger(__name__)
 
-CKPT_DIR        = Path(__file__).parent / "checkpoints"
-XGB_PATH        = CKPT_DIR / "xgb_forecaster.joblib"
-WEIGHTS_PATH    = CKPT_DIR / "ensemble_weights.json"
-
-DEFAULT_WEIGHTS = {"lstm": 0.45, "gru": 0.30, "xgb": 0.25}
+MEMBERS = ("lstm", "gru", "lgbm")
+DEFAULT_WEIGHTS = {"lstm": 0.4, "gru": 0.3, "lgbm": 0.3}
+_LABELS = np.array(["PM2.5", "PM10", "NO2", "SO2", "CO", "O3"])
 
 
 # ===========================================================================
-# Helpers
+# Loading
 # ===========================================================================
 
-def load_ensemble_weights() -> dict:
-    """
-    Return blend weights. Reads checkpoints/ensemble_weights.json if present,
-    otherwise falls back to sensible defaults. Always normalised to sum to 1.
-    """
-    if WEIGHTS_PATH.exists():
+def load_ensemble_weights(ckpt_dir=CHECKPOINT_DIR) -> dict[str, dict[str, float]]:
+    """{pollutant: {member: weight}} — falls back to DEFAULT_WEIGHTS for every pollutant."""
+    path = artifact_paths(ckpt_dir)["weights"]
+    if path.exists():
         try:
-            w = json.loads(WEIGHTS_PATH.read_text())
-            # Only keep keys we know about
-            w = {k: float(w.get(k, 0.0)) for k in DEFAULT_WEIGHTS}
+            return json.loads(path.read_text())
         except (ValueError, OSError) as e:
-            logger.warning("Could not parse {} ({}); using defaults.", WEIGHTS_PATH, e)
-            w = dict(DEFAULT_WEIGHTS)
-    else:
-        w = dict(DEFAULT_WEIGHTS)
-
-    total = sum(w.values()) or 1.0
-    return {k: v / total for k, v in w.items()}
+            logger.warning("Could not parse {} ({}); using defaults.", path, e)
+    return {p: dict(DEFAULT_WEIGHTS) for p in POLLUTANTS}
 
 
-def _prepare_window(sequence_df: pd.DataFrame, scaler_params: np.ndarray):
-    """Apply training-time scaler + return the last 168-hour normalised window."""
-    df = sequence_df.copy()
-    for col in LSTM_FEATURE_COLS:
-        if col not in df.columns:
-            df[col] = 0.0
-    df = df[LSTM_FEATURE_COLS].ffill(limit=3).bfill(limit=3)
-    df = df.fillna(df.median())
-
-    mean = scaler_params[0]
-    std  = np.where(scaler_params[1] == 0, 1.0, scaler_params[1])
-    norm = (df.values.astype(np.float32) - mean) / std
-
-    if len(norm) < LSTM_LOOKBACK_HOURS:
-        raise ValueError(
-            f"Need at least {LSTM_LOOKBACK_HOURS} hours of history, got {len(norm)}."
-        )
-    window = norm[-LSTM_LOOKBACK_HOURS:].copy()
-    return df, window, mean, std
+def load_members(device: torch.device, ckpt_dir=CHECKPOINT_DIR) -> dict:
+    members = {}
+    for name in ("lstm", "gru"):
+        try:
+            members[name] = load_checkpoint(device, name, ckpt_dir)
+        except CheckpointNotFoundError as e:
+            logger.warning("{}", e)
+    lgbm_path = artifact_paths(ckpt_dir)["lgbm"]
+    if lgbm_path.exists():
+        members["lgbm"] = joblib.load(lgbm_path)
+    if not members:
+        raise CheckpointNotFoundError("No trained ensemble members found. Run forecasting/train.py.")
+    return members
 
 
-def _autoregressive_nn(model, window: np.ndarray, device, hours: int) -> list[float]:
-    """Run an LSTM/GRU forecaster autoregressively for `hours` steps."""
-    preds_norm = []
-    cur = window.copy()
+def load_card(ckpt_dir=CHECKPOINT_DIR) -> dict:
+    path = artifact_paths(ckpt_dir)["card"]
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+# ===========================================================================
+# Prediction primitives (shared with training / evaluation)
+# ===========================================================================
+
+def predict_nn(model, store, index, spec: FeatureSpec, device, batch: int = 512) -> np.ndarray:
+    """(N, 24, 6) unscaled log-deltas."""
+    outs = []
+    model.eval()
     with torch.no_grad():
-        for _ in range(hours):
-            x = torch.from_numpy(cur[np.newaxis]).float().to(device)
-            p = float(model(x).cpu().numpy().squeeze())
-            preds_norm.append(p)
-            new = cur[-1].copy()
-            new[0] = p   # update AQI; weather held at persistence
-            cur = np.vstack([cur[1:], new])
-    return preds_norm
+        for i in range(0, len(index), batch):
+            past, fut = nn_batch(store, index[i:i + batch])
+            pred = model(torch.from_numpy(past).to(device), torch.from_numpy(fut).to(device))
+            outs.append(pred.cpu().numpy())
+    return np.concatenate(outs) * spec.target_std
 
 
-def _autoregressive_xgb(xgb_model, window: np.ndarray, hours: int) -> list[float]:
-    """
-    Run XGBoost autoregressively. The forecaster XGBoost is trained on a
-    flattened recent-history vector (last K hours of all features) and
-    predicts the NEXT AQI value, normalised in the same scaler space as
-    the NN models.
-    """
-    preds_norm = []
-    cur = window.copy()
-    # Use last 24 hours of features as the tabular input — matches train.py
-    k = min(24, cur.shape[0])
-    for _ in range(hours):
-        x_flat = cur[-k:].flatten().reshape(1, -1)
-        p = float(xgb_model.predict(x_flat).squeeze())
-        preds_norm.append(p)
-        new = cur[-1].copy()
-        new[0] = p
-        cur = np.vstack([cur[1:], new])
-    return preds_norm
+def predict_lgbm(models: dict, store, index, spec: FeatureSpec) -> np.ndarray:
+    """(N, 24, 6) unscaled log-deltas from the per-pollutant LightGBM models."""
+    rep = np.repeat(index, HORIZON, axis=0)
+    hs = np.tile(np.arange(1, HORIZON + 1), len(index))
+    X = lgbm_features(store, rep, hs)
+    out = np.zeros((len(index), HORIZON, len(POLLUTANTS)), dtype=np.float32)
+    for j, p in enumerate(POLLUTANTS):
+        out[:, :, j] = models[p].predict(X).reshape(len(index), HORIZON) * spec.target_std[:, j]
+    return out
+
+
+def predict_members(members: dict, store, index, spec, device) -> dict[str, np.ndarray]:
+    preds = {}
+    for name, m in members.items():
+        preds[name] = predict_lgbm(m, store, index, spec) if name == "lgbm" \
+            else predict_nn(m, store, index, spec, device)
+    return preds
+
+
+def blend(preds: dict[str, np.ndarray], weights: dict[str, dict[str, float]]) -> np.ndarray:
+    """Per-pollutant weighted average over whichever members are present."""
+    names = list(preds)
+    out = np.zeros_like(preds[names[0]])
+    for j, p in enumerate(POLLUTANTS):
+        w = np.array([weights.get(p, DEFAULT_WEIGHTS).get(n, 0.0) for n in names])
+        w = w / w.sum() if w.sum() > 0 else np.full(len(names), 1 / len(names))
+        out[:, :, j] = sum(wi * preds[n][:, :, j] for wi, n in zip(w, names))
+    return out
+
+
+def deltas_to_conc(last: np.ndarray, deltas: np.ndarray) -> np.ndarray:
+    """log1p(y_t) + Δ → concentrations (N, 24, 6)."""
+    return np.expm1(np.clip(last[:, None, :] + deltas, 0, None))
 
 
 # ===========================================================================
-# Public API
+# Public API — forecast every node
 # ===========================================================================
 
-def ensemble_forecast_24h(
-    sequence_df: pd.DataFrame,
-    forecast_hours: int = FORECAST_HOURS,
-    weights: Optional[dict] = None,
-) -> list[dict]:
+def forecast_all_nodes(nodes: pd.DataFrame, frame: pd.DataFrame,
+                       issue_time: Optional[datetime] = None, ckpt_dir=CHECKPOINT_DIR) -> pd.DataFrame:
     """
-    Produce a 24-hour blended AQI forecast from LSTM + GRU + XGBoost.
+    24h forecast for every node with enough history.
 
-    Parameters
-    ----------
-    sequence_df : pd.DataFrame
-        Hourly DataFrame with at least LSTM_LOOKBACK_HOURS rows and a
-        DatetimeIndex (UTC). Must contain the columns in LSTM_FEATURE_COLS
-        (missing ones are filled with 0).
-    forecast_hours : int
-        Forecast horizon. Default 24.
-    weights : dict, optional
-        Override blend weights, e.g. {"lstm": 0.5, "gru": 0.3, "xgb": 0.2}.
-        Defaults to load_ensemble_weights().
-
-    Returns
-    -------
-    list[dict] — one dict per forecast hour, matching the schema the
-    FastAPI /forecast endpoint already consumes.
+    `frame` is the ingestion output: hourly rows for [now - 8 days, now + 48h],
+    where the future rows carry Open-Meteo *forecast* weather.
+    Returns rows matching the aqi_forecasts table.
     """
-    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    weights = weights or load_ensemble_weights()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    spec = load_spec(ckpt_dir)
+    members = load_members(device, ckpt_dir)
+    weights = load_ensemble_weights(ckpt_dir)
+    card = load_card(ckpt_dir)
 
-    # --- Load LSTM (mandatory) ----------------------------------------
-    lstm_model, scaler_params = load_checkpoint(device, model_type="lstm")
-    _, window, mean, std = _prepare_window(sequence_df, scaler_params)
+    issue = pd.Timestamp(issue_time or datetime.now(timezone.utc)).floor("h")
+    store = build_store(frame, nodes, require_targets=False)
 
-    # --- Try to load GRU & XGB (optional, but warned if missing) ------
-    try:
-        gru_model, _ = load_checkpoint(device, model_type="gru")
-        have_gru = True
-    except CheckpointNotFoundError:
-        logger.warning("GRU checkpoint missing — falling back to LSTM-only.")
-        have_gru = False
+    index = []
+    for n, s in enumerate(store):
+        if issue in s.times:
+            t = s.times.get_loc(issue)
+            if s.valid[t]:
+                index.append((n, t))
+    if not index:
+        raise CheckpointNotFoundError(f"No node has a complete window at issue time {issue}.")
+    index = np.asarray(index)
+    logger.info("Forecasting {} / {} nodes at issue time {}", len(index), len(store), issue)
 
-    have_xgb = XGB_PATH.exists()
-    if have_xgb:
-        xgb_model = joblib.load(XGB_PATH)
+    norm = normalise_store(store, spec)
+    preds = predict_members(members, norm, index, spec, device)
+    ens = blend(preds, weights)
+
+    last = last_log(store, index)
+    hist = history_conc(store, index)
+    conc = deltas_to_conc(last, ens)
+    aqi, prom = aqi_along_paths(hist, conc)
+
+    # 80% interval from validation residual quantiles of the blended forecast
+    q = card.get("residual_quantiles")
+    if q:
+        lo = deltas_to_conc(last, ens + np.asarray(q["q10"])[None])
+        hi = deltas_to_conc(last, ens + np.asarray(q["q90"])[None])
+        aqi_lo, _ = aqi_along_paths(hist, lo)
+        aqi_hi, _ = aqi_along_paths(hist, hi)
     else:
-        logger.warning("XGBoost forecaster missing — ensemble will skip it.")
-        xgb_model = None
+        aqi_lo = aqi_hi = np.full_like(aqi, np.nan)
 
-    # --- Run each model autoregressively ------------------------------
-    lstm_preds = _autoregressive_nn(lstm_model, window, device, forecast_hours)
-    gru_preds  = _autoregressive_nn(gru_model,  window, device, forecast_hours) \
-                 if have_gru else lstm_preds
-    xgb_preds  = _autoregressive_xgb(xgb_model, window, forecast_hours) \
-                 if have_xgb else lstm_preds
+    member_aqi = {k: aqi_along_paths(hist, deltas_to_conc(last, v))[0] for k, v in preds.items()}
 
-    # --- Renormalise weights to the models we actually have -----------
-    eff_weights = {
-        "lstm": weights["lstm"],
-        "gru":  weights["gru"] if have_gru else 0.0,
-        "xgb":  weights["xgb"] if have_xgb else 0.0,
-    }
-    total = sum(eff_weights.values()) or 1.0
-    eff_weights = {k: v / total for k, v in eff_weights.items()}
-
-    # --- Blend & inverse-transform ------------------------------------
-    last_ts = sequence_df.index[-1]
-    out = []
-    aqi_mean, aqi_std = float(mean[0]), float(std[0])
-
-    for h in range(forecast_hours):
-        blended_norm = (
-            eff_weights["lstm"] * lstm_preds[h]
-            + eff_weights["gru"]  * gru_preds[h]
-            + eff_weights["xgb"]  * xgb_preds[h]
-        )
-        blended_aqi = max(0, round(blended_norm * aqi_std + aqi_mean))
-        lstm_aqi    = max(0, round(lstm_preds[h] * aqi_std + aqi_mean))
-        gru_aqi     = max(0, round(gru_preds[h]  * aqi_std + aqi_mean))
-        xgb_aqi     = max(0, round(xgb_preds[h]  * aqi_std + aqi_mean))
-
-        out.append({
-            "forecast_target_time":  last_ts + pd.Timedelta(hours=h + 1),
-            "hours_ahead":           h + 1,
-            "aqi_forecast":          int(blended_aqi),
-            "aqi_category_forecast": aqi_category(blended_aqi),
-            "aqi_lstm":              int(lstm_aqi),
-            "aqi_gru":               int(gru_aqi),
-            "aqi_xgb":               int(xgb_aqi),
-            "ensemble_weights":      eff_weights,
-        })
-
-    logger.info(
-        "Ensemble 24h forecast | weights={} | AQI range [{} – {}]",
-        eff_weights,
-        min(o["aqi_forecast"] for o in out),
-        max(o["aqi_forecast"] for o in out),
-    )
+    version = card.get("model_version", "untrained")
+    rows = []
+    for i, (n, t) in enumerate(index):
+        h_ = store[n].location_hash
+        for h in range(HORIZON):
+            rows.append({
+                "forecast_generated_at": issue.to_pydatetime(),
+                "forecast_target_time": (issue + pd.Timedelta(hours=h + 1)).to_pydatetime(),
+                "location_hash": h_,
+                "hours_ahead": h + 1,
+                **{p: float(conc[i, h, j]) for j, p in enumerate(POLLUTANTS)},
+                "aqi": int(round(aqi[i, h])),
+                "aqi_lower": None if np.isnan(aqi_lo[i, h]) else int(round(aqi_lo[i, h])),
+                "aqi_upper": None if np.isnan(aqi_hi[i, h]) else int(round(aqi_hi[i, h])),
+                "aqi_category": aqi_category(int(round(aqi[i, h]))),
+                "prominent_pollutant": _LABELS[prom[i, h]],
+                **{f"aqi_{k}": int(round(member_aqi[k][i, h])) if k in member_aqi else None
+                   for k in MEMBERS},
+                "model_version": version,
+            })
+    out = pd.DataFrame(rows)
+    logger.info("Ensemble forecast | members={} | AQI range [{} – {}]",
+                list(preds), out["aqi"].min(), out["aqi"].max())
     return out
