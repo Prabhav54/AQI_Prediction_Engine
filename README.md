@@ -6,7 +6,9 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-LSTM%20%2B%20GRU-EE4C2C.svg?logo=pytorch)](https://pytorch.org/)
 [![TimescaleDB](https://img.shields.io/badge/TimescaleDB%20%2F%20Postgres-FDB515.svg?logo=postgresql)](https://www.timescale.com/)
 
-**Live dashboard:** https://pan-india-aqi.vercel.app (snapshot mode until the Neon DB is attached; see Production below)
+**Live dashboard:** https://pan-india-aqi.vercel.app
+
+> **Status (2026-10-14):** the dashboard is deployed and serves a bundled snapshot of a full 386-node forecast run (`web/public/snapshot.json`). Live, 3-hourly updates switch on automatically once the Neon database is attached (see [Production](#production-github-actions--neon--vercel)). Until then, a banner on the page shows the snapshot time.
 
 Forecasts the CPCB **Air Quality Index and all six regulated pollutants** (PM2.5, PM10, NO₂, SO₂, CO, O₃) **24 hours ahead, hour by hour, across the whole of India**. It covers 386 nodes: all 112 state capitals and million-plus cities, plus a 1° grid clipped to India's borders. A 0.5° grid (1,202 nodes) is a config switch.
 
@@ -35,7 +37,6 @@ Test window 2026-09-06 → 2026-10-12 (11,200 node × issue-time forecasts, 24 h
 * The ensemble beats its best single member (LightGBM) with Wilcoxon signed-rank p ≈ 1e-47.
 * The 80% AQI prediction interval covers **86.8%** of test outcomes (the target is 80%).
 * AQI MAE grows from 0.4 at +1h to 18.7 at +24h. Persistence reaches 60 by +15h.
-
 * **Skill** = reduction in AQI MAE versus persistence ("the next 24h look like now"), averaged over every horizon from 1 to 24h and every node.
 * **Category hit** = the share of forecasts that land in the correct CPCB band (Good … Severe).
 * All figures come from `forecasting/checkpoints/model_card.json`, which every training run writes. Live skill of deployed forecasts is scored in-database every run (`forecast_skill` table) and shown on the dashboard.
@@ -73,7 +74,7 @@ Open-Meteo   │  ingest            CPCB math (SQL)       ensemble inference │
 * **Use forecast weather.** Tomorrow's PM depends mostly on tomorrow's boundary-layer height, wind and rain. The old model held weather constant for 24h; this one feeds the next-24h weather forecast directly into the decoder.
 * **Direct multi-horizon, not autoregressive.** All 24 steps come from one forward pass, so errors don't compound.
 * **Forecast pollutants, then derive AQI.** AQI is a 24h/8h rolling mean, so the CPCB math is applied to observed history plus forecast. The forecast AQI is therefore exactly the number CPCB will publish when those hours are observed.
-* **One global model.** Training on ~140 nodes across every climate zone lets the model forecast rural grid nodes that have no special history.
+* **One global model.** Training on nodes from every climate zone (80 nodes for the current checkpoint, 140+ in the weekly retrain) lets the model forecast rural grid nodes that have no history of their own in the training data.
 * **Patching.** Every 4 hours are concatenated into one encoder step (PatchTST). The RNN still sees all 168 hours but trains about 50× faster on CPU, which is what makes weekly retraining in free CI possible.
 
 ---
@@ -122,16 +123,30 @@ docker compose run --rm pipeline         # one pipeline pass
 ### Retraining
 
 ```bash
-python run_pipeline.py backfill --start 2025-10-01 --end 2026-10-12 --out data/history.parquet
+# resumable: finished batches are kept in data/history_parts/ if the run is interrupted
+python run_pipeline.py backfill --start 2025-10-01 --end 2026-10-12 --grid-stride 10 --out data/history.parquet
 python forecasting/train.py --source parquet --data data/history.parquet            # writes checkpoints + model card
 python forecasting/train.py --source parquet --data data/history.parquet --promote-if-better
 ```
 
+Training on a CPU laptop takes about 30 minutes: LSTM and GRU with early stopping, LightGBM, blend-weight search, then test evaluation.
+
+### Refreshing the bundled dashboard snapshot
+
+```bash
+python run_pipeline.py all
+python run_pipeline.py export-snapshot --out web/public/snapshot.json
+cd web && vercel deploy --prod
+```
+
 ### Production (GitHub Actions + Neon + Vercel)
 
-1. In the Vercel project (root directory `web`), add the **Neon** integration from the Marketplace. This injects `DATABASE_URL`.
-2. Copy that connection string into the GitHub repo secret **`DATABASE_URL`**.
-3. Run the **Pan-India pipeline** workflow once with **setup_db = true**. After that, the cron keeps it fresh every 3 hours.
+The Vercel project `pan-india-aqi` deploys from `web/`. Vercel detects the FastAPI preset: `web/api/index.py` serves `/api/*`, and `web/public/` holds the static dashboard and snapshot.
+
+1. In the Vercel project, open **Storage** and add **Neon** from the Marketplace. This injects `DATABASE_URL`. Redeploy so the API picks it up.
+2. Copy that connection string into the GitHub repo secret **`DATABASE_URL`** (Settings → Secrets and variables → Actions).
+3. Merge this branch into `main`, because scheduled workflows only run from the default branch.
+4. Run the **Pan-India pipeline** workflow once with **setup_db = true**. This creates the schema and the 386 nodes, then ingests and forecasts. After that, the cron keeps it fresh every 3 hours, and the dashboard reads live data instead of the snapshot.
 
 The cadence is deliberate. CAMS updates twice a day, and 386 nodes × 2 endpoints × 8 runs ≈ 6.2k calls/day fits Open-Meteo's free 10k/day quota.
 
@@ -149,3 +164,5 @@ The cadence is deliberate. CAMS updates twice a day, and 386 nodes × 2 endpoint
 * Bias-correct against CPCB / OpenAQ station observations, so that CAMS becomes a feature and a baseline instead of the target.
 * A Temporal Fusion Transformer member with native quantile outputs.
 * Rolling-origin backtests across all seasons (Diwali, stubble burning, monsoon) instead of a single test window.
+* Report live skill (`forecast_skill`) next to offline test skill after two weeks of live runs, and explain the gap between them.
+* Retrain on the full node set (140+ nodes from the complete backfill) instead of the current 80.
