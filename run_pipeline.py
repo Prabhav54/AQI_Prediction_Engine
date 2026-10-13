@@ -118,7 +118,7 @@ def cmd_backfill(args):
 
 def cmd_export_snapshot(args):
     """
-    Dump what the Vercel API serves into one JSON file (web/snapshot.json).
+    Dump what the Vercel API serves into one JSON file (web/public/snapshot.json).
     The dashboard falls back to it when no database is connected, so the
     deployed site always shows real model output.
     """

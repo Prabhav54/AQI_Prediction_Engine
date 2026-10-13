@@ -6,7 +6,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-LSTM%20%2B%20GRU-EE4C2C.svg?logo=pytorch)](https://pytorch.org/)
 [![TimescaleDB](https://img.shields.io/badge/TimescaleDB%20%2F%20Postgres-FDB515.svg?logo=postgresql)](https://www.timescale.com/)
 
-**Live dashboard:** <!-- DEPLOY_URL -->
+**Live dashboard:** https://pan-india-aqi.vercel.app (snapshot mode until the Neon DB is attached; see Production below)
 
 Forecasts the CPCB **Air Quality Index and all six regulated pollutants** (PM2.5, PM10, NO₂, SO₂, CO, O₃) **24 hours ahead, hour by hour, across the whole of India**. It covers 386 nodes: all 112 state capitals and million-plus cities, plus a 1° grid clipped to India's borders. A 0.5° grid (1,202 nodes) is a config switch.
 
@@ -16,7 +16,25 @@ A single **global** LSTM + GRU + LightGBM ensemble is trained across every node.
 
 ## Results (held-out test, never seen in training or model selection)
 
-<!-- METRICS -->
+Test window 2026-09-06 → 2026-10-12 (11,200 node × issue-time forecasts, 24 hourly steps each). The model was trained on 80 nodes covering Oct 2025 → Aug 2026 and is model version `2026.10.13-5f7e142`.
+
+| Model | AQI MAE | AQI RMSE | Category hit | Skill vs persistence |
+|---|---:|---:|---:|---:|
+| Persistence | 39.0 | 57.1 | 54.7% | — |
+| Seasonal-naive (same hour yesterday) | 16.6 | 29.2 | 78.4% | +57.5% |
+| LSTM | 14.0 | 25.5 | 82.4% | +64.0% |
+| GRU | 13.3 | 23.6 | 83.2% | +66.0% |
+| LightGBM | 12.1 | 22.4 | 84.4% | +69.0% |
+| **Ensemble** | **11.7** | **21.7** | **84.8%** | **+69.9%** |
+
+| Pollutant (24h-ahead hourly) | PM2.5 | PM10 | NO₂ | SO₂ | CO | O₃ |
+|---|---:|---:|---:|---:|---:|---:|
+| Ensemble MAE (µg/m³; CO mg/m³) | 8.4 | 20.0 | 3.8 | 3.5 | 0.07 | 11.9 |
+| Skill vs persistence | +35% | +25% | +68% | +37% | +51% | +75% |
+
+* The ensemble beats its best single member (LightGBM) with Wilcoxon signed-rank p ≈ 1e-47.
+* The 80% AQI prediction interval covers **86.8%** of test outcomes (the target is 80%).
+* AQI MAE grows from 0.4 at +1h to 18.7 at +24h. Persistence reaches 60 by +15h.
 
 * **Skill** = reduction in AQI MAE versus persistence ("the next 24h look like now"), averaged over every horizon from 1 to 24h and every node.
 * **Category hit** = the share of forecasts that land in the correct CPCB band (Good … Severe).
@@ -71,7 +89,7 @@ forecasting/        dataset.py · model.py · ensemble.py · train.py · evaluat
 ingestion/          weather_client.py · pipeline.py · grid_generator.py · nodes/*.csv · geocoder.py · gee_client.py
 proxy_model/        XGBoost AOD→PM gap-filler (only fills hours where CAMS PM is missing)
 ui/app.py           Streamlit dashboard
-web/                Vercel deployment: api/index.py + index.html
+web/                Vercel deployment: api/index.py (FastAPI) + public/index.html, public/snapshot.json
 run_pipeline.py     all | ingest | forecast | skill | prune | backfill | export-snapshot
 ```
 
