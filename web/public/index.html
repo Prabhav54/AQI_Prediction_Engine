@@ -4,63 +4,102 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pan-India AQI Forecast</title>
-<meta name="description" content="24-hour CPCB AQI and pollutant forecasts for every part of India from an LSTM + GRU + LightGBM ensemble.">
+<meta name="description" content="Hour-by-hour 24-hour CPCB AQI and pollutant forecasts for any place in India.">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #f6f7f9; --panel: #ffffff; --ink: #111418; --muted: #5d6673; --line: #e3e6eb;
-    --accent: #2f6fed; --band: rgba(47,111,237,.14);
+    --bg: #f4f6f9; --panel: #ffffff; --ink: #111418; --muted: #5d6673; --line: #e3e6eb;
+    --accent: #2f6fed; --band: rgba(47,111,237,.16); --soft: #eef2f8;
     --good: #2e9e5b; --sat: #8bc34a; --mod: #e6b800; --poor: #f08c00; --vpoor: #e03131; --sev: #8e1b3a;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
       --bg: #0d1014; --panel: #161a20; --ink: #e8ebef; --muted: #98a1ad; --line: #262c35;
-      --accent: #5b8cff; --band: rgba(91,140,255,.18);
+      --accent: #5b8cff; --band: rgba(91,140,255,.2); --soft: #1d232b;
     }
   }
   :root[data-theme="dark"] {
     --bg: #0d1014; --panel: #161a20; --ink: #e8ebef; --muted: #98a1ad; --line: #262c35;
-    --accent: #5b8cff; --band: rgba(91,140,255,.18);
+    --accent: #5b8cff; --band: rgba(91,140,255,.2); --soft: #1d232b;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; height: 100%; }
+  html, body { margin: 0; }
   body { background: var(--bg); color: var(--ink); font: 14px/1.45 Inter, system-ui, sans-serif; }
-  header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
-  header h1 { font-size: 16px; margin: 0; font-weight: 700; letter-spacing: -.01em; }
+  button { font: inherit; color: inherit; }
+
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 800; letter-spacing: -.01em; white-space: nowrap; }
   header .sub { color: var(--muted); font-size: 12px; }
-  .search { margin-left: auto; position: relative; width: min(320px, 100%); }
-  .search input { width: 100%; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; }
-  .search ul { position: absolute; z-index: 1000; top: 100%; left: 0; right: 0; margin: 4px 0 0; padding: 4px; list-style: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; max-height: 280px; overflow: auto; display: none; }
-  .search li { padding: 6px 8px; border-radius: 6px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
-  .search li:hover, .search li.active { background: var(--bg); }
-  main { display: grid; grid-template-columns: minmax(0, 1fr) 420px; height: calc(100% - 57px); }
-  #map { height: 100%; background: var(--bg); }
-  aside { overflow-y: auto; border-left: 1px solid var(--line); background: var(--panel); padding: 16px; }
-  .card { border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
-  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
-  .place { font-size: 18px; font-weight: 700; margin: 0; }
-  .meta { color: var(--muted); font-size: 12px; }
-  .now { display: flex; align-items: center; gap: 14px; margin-top: 10px; }
-  .big { font-size: 48px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
-  .chip { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; color: #fff; }
-  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-  th, td { text-align: right; padding: 5px 4px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+  .searchbar { flex: 1; display: flex; gap: 8px; max-width: 620px; margin-left: auto; position: relative; }
+  .searchbar input { flex: 1; min-width: 0; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; font-size: 15px; }
+  .searchbar input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .btn { padding: 0 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); cursor: pointer; white-space: nowrap; }
+  .btn:hover { border-color: var(--accent); }
+  #results { position: absolute; z-index: 1000; top: calc(100% + 4px); left: 0; right: 0; margin: 0; padding: 4px; list-style: none; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; max-height: 340px; overflow: auto; display: none; box-shadow: 0 8px 24px rgba(0,0,0,.12); }
+  #results li { padding: 8px 10px; border-radius: 6px; cursor: pointer; display: flex; justify-content: space-between; gap: 10px; }
+  #results li:hover, #results li.active { background: var(--soft); }
+  #results .grp { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); cursor: default; padding: 6px 10px 2px; }
+  #results .grp:hover { background: none; }
+  #results small { color: var(--muted); }
+
+  main { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(320px, 1fr); gap: 16px; padding: 16px 20px; max-width: 1600px; margin: 0 auto; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; }
+  .banner { padding: 8px 12px; border-radius: 8px; background: var(--band); font-size: 12.5px; margin-bottom: 12px; display: none; }
+
+  .summary { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 28px; }
+  .place { font-size: 22px; font-weight: 800; margin: 0; letter-spacing: -.01em; }
+  .meta { color: var(--muted); font-size: 12.5px; }
+  .stat .label { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em; }
+  .stat .val { font-size: 34px; font-weight: 800; line-height: 1.05; font-variant-numeric: tabular-nums; }
+  .stat .val small { font-size: 13px; font-weight: 600; margin-left: 6px; }
+  .chip { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; color: #fff; vertical-align: middle; }
+
+  .chartwrap { position: relative; height: clamp(320px, 52vh, 560px); margin-top: 16px; }
+  .chart-key { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .chart-key i { display: inline-block; width: 18px; height: 3px; vertical-align: middle; margin-right: 6px; border-radius: 2px; }
+
+  .pols { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-top: 18px; }
+  .pol { background: var(--soft); border-radius: 10px; padding: 10px 12px; }
+  .pol .n { font-weight: 700; font-size: 13px; }
+  .pol .v { font-size: 20px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .pol .u { color: var(--muted); font-size: 11px; }
+  .pol .f { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .pol.top { outline: 2px solid var(--accent); }
+
+  .mapcol { display: flex; flex-direction: column; gap: 12px; position: sticky; top: 16px; height: calc(100vh - 110px); min-height: 420px; }
+  .mapbox { position: relative; flex: 1; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); }
+  #map { position: absolute; inset: 0; background: var(--bg); }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .hint { color: var(--muted); font-size: 12px; }
+
+  details.about { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+  details.about summary { cursor: pointer; color: var(--muted); font-size: 13px; font-weight: 600; }
+  details.about[open] summary { margin-bottom: 10px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; margin-bottom: 10px; }
+  th, td { text-align: right; padding: 5px 6px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
   th:first-child, td:first-child { text-align: left; }
   th { color: var(--muted); font-weight: 500; }
   tr.hl td { font-weight: 700; }
-  .legend { position: absolute; z-index: 500; left: 12px; bottom: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; font-size: 11.5px; }
-  .legend div { display: flex; align-items: center; gap: 6px; }
-  .legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-  .banner { padding: 8px 12px; border-radius: 8px; background: var(--band); font-size: 12.5px; margin-bottom: 12px; display: none; }
-  .empty { color: var(--muted); text-align: center; padding: 40px 10px; }
-  canvas { max-width: 100%; }
-  .note { color: var(--muted); font-size: 11.5px; margin-top: 8px; }
-  @media (max-width: 900px) {
-    main { grid-template-columns: 1fr; grid-template-rows: 55vh auto; height: auto; }
-    aside { border-left: 0; border-top: 1px solid var(--line); }
-    .search { margin-left: 0; width: 100%; }
+  .empty { color: var(--muted); text-align: center; padding: 80px 10px; }
+
+  @media (max-width: 1000px) {
+    main { grid-template-columns: minmax(0, 1fr); padding: 12px 16px; }
+    .mapcol { position: static; height: 60vh; }
+    .pols { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
+  @media (max-width: 560px) {
+    header { padding: 10px 16px; }
+    .searchbar { max-width: none; flex-basis: 100%; min-width: 0; }
+    .searchbar input { font-size: 14px; }
+    #locate .txt { display: none; }
+    .panel { padding: 14px; }
+    .stat .val { font-size: 28px; }
+    .pols { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .chartwrap { height: 300px; }
   }
   .leaflet-container { font: inherit; }
 </style>
@@ -71,38 +110,55 @@
     <h1>Pan-India AQI Forecast</h1>
     <div class="sub" id="updated">Loading…</div>
   </div>
-  <div class="search">
-    <input id="q" type="search" placeholder="Search a city or state…" autocomplete="off" aria-label="Search location">
+  <div class="searchbar">
+    <input id="q" type="search" placeholder="Search a place, or enter coordinates e.g. 28.61, 77.21" autocomplete="off" aria-label="Search a place or coordinates">
+    <button class="btn" id="locate" title="Use my location" aria-label="Use my location">📍<span class="txt"> My location</span></button>
     <ul id="results" role="listbox"></ul>
   </div>
 </header>
+
 <main>
-  <div style="position:relative">
-    <div id="map" aria-label="Map of AQI across India"></div>
-    <div class="legend" id="legend"></div>
-  </div>
-  <aside>
+  <section class="panel">
     <div class="banner" id="banner"></div>
-    <div id="detail"><div class="empty">Select any point on the map or search a city to see its 24-hour forecast.</div></div>
-    <div class="card" id="skill"><h2>Model performance</h2><div class="meta">Loading…</div></div>
-  </aside>
+    <div id="detail"><div class="empty">Loading forecast…</div></div>
+    <details class="about" id="about">
+      <summary>About the model &amp; accuracy</summary>
+      <div id="skill" class="meta">Loading…</div>
+    </details>
+  </section>
+
+  <section class="mapcol">
+    <div class="mapbox"><div id="map" aria-label="Map of current AQI across India"></div></div>
+    <div class="legend" id="legend"></div>
+    <div class="hint">Click anywhere on the map to see the forecast for that spot.</div>
+  </section>
 </main>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script>
 const CATS = [
-  ["Good", "--good", 50], ["Satisfactory", "--sat", 100], ["Moderate", "--mod", 200],
-  ["Poor", "--poor", 300], ["Very Poor", "--vpoor", 400], ["Severe", "--sev", 500],
+  ["Good", "--good", 0, 50], ["Satisfactory", "--sat", 51, 100], ["Moderate", "--mod", 101, 200],
+  ["Poor", "--poor", 201, 300], ["Very Poor", "--vpoor", 301, 400], ["Severe", "--sev", 401, 500],
 ];
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const catColor = c => css((CATS.find(x => x[0] === c) || CATS[2])[1]);
-const aqiColor = a => catColor((CATS.find(x => a <= x[2]) || CATS[5])[0]);
-const fmtTime = t => new Date(t).toLocaleString("en-IN", { hour: "2-digit", minute: "2-digit", day: "numeric", month: "short", timeZone: "Asia/Kolkata" });
-const POLS = [["pm25", "PM2.5", "µg/m³"], ["pm10", "PM10", "µg/m³"], ["no2", "NO₂", "µg/m³"], ["so2", "SO₂", "µg/m³"], ["co", "CO", "mg/m³"], ["o3", "O₃", "µg/m³"]];
+const aqiCat = a => (CATS.find(x => a <= x[3]) || CATS[5])[0];
+const aqiColor = a => catColor(aqiCat(a));
+const IST = { timeZone: "Asia/Kolkata" };
+const fmtTime = t => new Date(t).toLocaleString("en-IN", { hour: "numeric", minute: "2-digit", day: "numeric", month: "short", ...IST });
+const fmtHour = t => new Date(t).toLocaleString("en-IN", { hour: "numeric", ...IST });
+const POLS = [
+  ["pm25", "PM2.5", "µg/m³", "pm25_24h_avg"], ["pm10", "PM10", "µg/m³", "pm10_24h_avg"],
+  ["no2", "NO₂", "µg/m³", "no2_24h_avg"], ["so2", "SO₂", "µg/m³", "so2_24h_avg"],
+  ["co", "CO", "mg/m³", "co_8h_avg"], ["o3", "O₃", "µg/m³", "o3_8h_avg"],
+];
+const prettyPol = p => String(p ?? "—").replace("NO2", "NO₂").replace("SO2", "SO₂").replace("O3", "O₃");
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-let snapshot = null, nodes = [], markers = {}, chart = null, selected = null;
+let snapshot = null, nodes = [], markers = {}, chart = null, selected = null, pin = null;
 
+// ---------- data: live API, falling back to the bundled snapshot ----------
 async function api(path) {
   if (!snapshot) {
     try {
@@ -113,7 +169,7 @@ async function api(path) {
     snapshot = await (await fetch("/snapshot.json")).json();
     const b = document.getElementById("banner");
     b.style.display = "block";
-    b.textContent = `Showing a saved snapshot from ${fmtTime(snapshot.generated_at)} IST — the live database is not connected.`;
+    b.textContent = `Offline mode: showing saved data from ${fmtTime(snapshot.generated_at)} IST.`;
   }
   if (path === "/api/nodes") return { generated_at: snapshot.generated_at, nodes: snapshot.nodes };
   if (path === "/api/skill") return snapshot.skill;
@@ -122,160 +178,331 @@ async function api(path) {
   return snapshot.details[h];
 }
 
-const map = L.map("map", { zoomControl: true, preferCanvas: true }).setView([22.5, 80], 5);
-function tiles() {
-  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
-  return L.tileLayer(`https://{s}.basemaps.cartocdn.com/${dark ? "dark_all" : "light_all"}/{z}/{x}/{y}{r}.png`, {
-    attribution: '&copy; OpenStreetMap &copy; CARTO | Data: Open-Meteo / Copernicus CAMS', maxZoom: 10, minZoom: 4,
-  });
-}
-tiles().addTo(map);
+// ---------- map ----------
+const map = L.map("map", { zoomControl: true, preferCanvas: true }).setView([22.5, 80], 4.6);
+const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+L.tileLayer(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${dark ? "Dark" : "Light"}_Gray_Base/MapServer/tile/{z}/{y}/{x}`, {
+  attribution: "Tiles &copy; Esri", maxZoom: 11, minZoom: 4,
+}).addTo(map);
 map.setMaxBounds([[2, 60], [40, 102]]);
+map.on("click", e => goTo(e.latlng.lat, e.latlng.lng, `${e.latlng.lat.toFixed(2)}, ${e.latlng.lng.toFixed(2)}`));
 
-document.getElementById("legend").innerHTML = CATS.map(([n, v, hi]) =>
-  `<div><i style="background:${css(v)}"></i>${n} <span style="color:var(--muted)">≤${hi}</span></div>`).join("");
+document.getElementById("legend").innerHTML = CATS.map(([n, v, lo, hi]) =>
+  `<span><i style="background:${css(v)}"></i>${n} <span class="meta">${lo}–${hi}</span></span>`).join("");
 
 async function loadNodes() {
   const d = await api("/api/nodes");
   nodes = d.nodes;
   const latest = nodes.reduce((m, n) => n.t > m ? n.t : m, "");
-  document.getElementById("updated").textContent =
-    `${nodes.length} locations · CPCB AQI as of ${latest ? fmtTime(latest) : "—"} IST`;
+  document.getElementById("updated").textContent = `${nodes.length} locations · updated ${latest ? fmtTime(latest) : "—"} IST`;
   for (const n of nodes) {
     const m = L.circleMarker([n.lat, n.lon], {
-      radius: n.kind === "city" ? 6 : 4.5, weight: n.kind === "city" ? 1.5 : 0,
+      radius: n.kind === "city" ? 6 : 4.5, weight: n.kind === "city" ? 1.2 : 0,
       color: css("--ink"), fillColor: aqiColor(n.aqi), fillOpacity: .9,
     }).addTo(map);
-    m.bindTooltip(`<b>${n.name}</b><br>AQI ${n.aqi} · ${n.cat} · ${n.pol}`);
-    m.on("click", () => select(n.h));
+    m.bindTooltip(`<b>${esc(n.name)}</b><br>AQI ${n.aqi} · ${esc(n.cat)}`);
+    m.on("click", ev => { L.DomEvent.stopPropagation(ev); clearPin(); setUrl({}); select(n.h); });
     markers[n.h] = m;
   }
-  const delhi = nodes.find(n => n.name === "Delhi");
-  if (delhi) select(delhi.h, false);
+  if (!(await openFromUrl())) {
+    const delhi = nodes.find(n => n.name === "Delhi");
+    if (delhi) select(delhi.h, false);
+  }
 }
 
-async function select(h, fly = true) {
+// Shareable links: ?q=Noida  or  ?lat=28.61&lon=77.21
+async function openFromUrl() {
+  const p = new URLSearchParams(location.search);
+  const lat = parseFloat(p.get("lat")), lon = parseFloat(p.get("lon"));
+  if (Number.isFinite(lat) && Number.isFinite(lon)) { goTo(lat, lon, `${lat.toFixed(3)}, ${lon.toFixed(3)}`); return true; }
+  const t = (p.get("q") || "").trim();
+  if (!t) return false;
+  const c = parseCoords(t);
+  if (c && !c.outside) { goTo(c.lat, c.lon, t); return true; }
+  const places = await geocode(t);
+  if (!places.length) return false;
+  q.value = places[0].name;
+  goTo(places[0].latitude, places[0].longitude, places[0].name);
+  return true;
+}
+
+function setUrl(params) {
+  const u = new URL(location.href);
+  u.search = new URLSearchParams(params).toString();
+  history.replaceState(null, "", u);
+}
+
+async function geocode(t) {
+  try {
+    const r = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(t)}&count=6&language=en&countryCode=IN`);
+    return (await r.json()).results || [];
+  } catch { return []; }
+}
+
+// ---------- nearest forecast point for any coordinate ----------
+function nearest(lat, lon) {
+  let best = null, bestKm = Infinity;
+  const k = Math.cos(lat * Math.PI / 180);
+  for (const n of nodes) {
+    const km = 111.32 * Math.hypot(n.lat - lat, (n.lon - lon) * k);
+    if (km < bestKm) { best = n; bestKm = km; }
+  }
+  return best ? { node: best, km: bestKm } : null;
+}
+function clearPin() { if (pin) { map.removeLayer(pin); pin = null; } }
+function goTo(lat, lon, label) {
+  const hit = nearest(lat, lon);
+  if (!hit || hit.km > 150) {
+    document.getElementById("detail").innerHTML = `<div class="empty">${esc(label)} is outside India's forecast coverage.</div>`;
+    return;
+  }
+  clearPin();
+  pin = L.marker([lat, lon]).addTo(map).bindTooltip(esc(label));
+  setUrl({ lat: lat.toFixed(4), lon: lon.toFixed(4) });
+  select(hit.node.h, true, { label, km: hit.km, lat, lon });
+}
+
+async function select(h, fly = true, from = null) {
   selected = h;
   const n = nodes.find(x => x.h === h);
-  if (fly && n) map.flyTo([n.lat, n.lon], Math.max(map.getZoom(), 7), { duration: .6 });
-  Object.entries(markers).forEach(([k, m]) => m.setStyle({ weight: k === h ? 3 : (nodes.find(x => x.h === k)?.kind === "city" ? 1.5 : 0) }));
+  if (fly && n) map.flyTo(from ? [from.lat, from.lon] : [n.lat, n.lon], Math.max(map.getZoom(), 7), { duration: .6 });
+  Object.entries(markers).forEach(([k, m]) => m.setStyle({ weight: k === h ? 3.5 : (nodes.find(x => x.h === k)?.kind === "city" ? 1.2 : 0) }));
   let d;
   try { d = await api(`/api/node/${h}`); }
   catch { document.getElementById("detail").innerHTML = `<div class="empty">No recent data for this location.</div>`; return; }
   if (selected !== h) return;
-  renderDetail(d);
+  renderDetail(d, from);
 }
 
-function renderDetail({ node, forecast, history }) {
-  const peak = forecast.reduce((m, f) => f.aqi > m.aqi ? f : m, forecast[0] || { aqi: 0 });
-  const at = k => forecast.find(f => f.hours_ahead === k);
-  const rows = POLS.map(([k, label, unit]) => {
-    const cells = [6, 12, 24].map(hh => at(hh)?.[k]);
+// ---------- detail panel ----------
+function renderDetail({ node, forecast, history }, from) {
+  const el = document.getElementById("detail");
+  const title = from ? from.label : node.location_name;
+  const where = from && from.km > 3
+    ? `Nearest forecast point: <b>${esc(node.location_name)}</b> (${from.km.toFixed(0)} km away)`
+    : esc([node.state, `${node.lat.toFixed(2)}°N, ${node.lon.toFixed(2)}°E`].filter(Boolean).join(" · "));
+  if (!forecast.length) {
+    el.innerHTML = `<p class="place">${esc(title)}</p><div class="meta">${where}</div><div class="empty">No forecast yet for this location.</div>`;
+    return;
+  }
+  const peak = forecast.reduce((m, f) => f.aqi > m.aqi ? f : m, forecast[0]);
+  const last = forecast[forecast.length - 1];
+  const tiles = POLS.map(([k, label, unit, nowKey]) => {
     const dp = k === "co" ? 2 : 0;
-    return `<tr><td>${label} <span class="meta">${unit}</span></td>${cells.map(v => `<td>${v == null ? "—" : Number(v).toFixed(dp)}</td>`).join("")}</tr>`;
+    const now = node[nowKey], fut = last[k];
+    const fmt = v => v == null ? "—" : Number(v).toFixed(dp);
+    return `<div class="pol ${node.prominent_pollutant === label.replace("₂", "2").replace("₃", "3") ? "top" : ""}">
+      <div class="n">${label}</div>
+      <div class="v">${fmt(now)} <span class="u">${unit}</span></div>
+      <div class="f">+24h: <b>${fmt(fut)}</b></div></div>`;
   }).join("");
-  const last = forecast[forecast.length - 1] || {};
-  document.getElementById("detail").innerHTML = `
-    <div class="card">
-      <p class="place">${node.location_name}</p>
-      <div class="meta">${node.state || ""} · ${node.lat.toFixed(2)}°N, ${node.lon.toFixed(2)}°E · ${node.kind === "city" ? "city node" : "grid node"}</div>
-      <div class="now">
-        <div class="big" style="color:${catColor(node.aqi_category)}">${node.aqi}</div>
-        <div>
-          <span class="chip" style="background:${catColor(node.aqi_category)}">${node.aqi_category}</span>
-          <div class="meta" style="margin-top:6px">Prominent: <b>${node.prominent_pollutant}</b> · ${fmtTime(node.timestamp)} IST</div>
-        </div>
-      </div>
+
+  el.innerHTML = `
+    <p class="place">${esc(title)}</p>
+    <div class="meta">${where}</div>
+    <div class="summary" style="margin-top:14px">
+      <div class="stat"><div class="label">Now · ${fmtHour(node.timestamp)}</div>
+        <div class="val" style="color:${catColor(node.aqi_category)}">${node.aqi}<small><span class="chip" style="background:${catColor(node.aqi_category)}">${esc(node.aqi_category)}</span></small></div></div>
+      <div class="stat"><div class="label">24h peak · ${fmtTime(peak.forecast_target_time)}</div>
+        <div class="val" style="color:${catColor(peak.aqi_category)}">${peak.aqi}<small><span class="chip" style="background:${catColor(peak.aqi_category)}">${esc(peak.aqi_category)}</span></small></div></div>
+      <div class="stat"><div class="label">In 24 hours</div>
+        <div class="val" style="color:${catColor(last.aqi_category)}">${last.aqi}<small class="meta">${last.aqi_lower}–${last.aqi_upper}</small></div></div>
+      <div class="stat"><div class="label">Main pollutant</div><div class="val" style="font-size:24px">${esc(prettyPol(node.prominent_pollutant))}</div></div>
     </div>
-    <div class="card">
-      <h2>Next 24 hours</h2>
-      ${forecast.length ? `<div class="meta" style="margin-bottom:8px">Peak <b style="color:${catColor(peak.aqi_category)}">${peak.aqi} (${peak.aqi_category})</b> at ${fmtTime(peak.forecast_target_time)} · shaded band = 80% interval</div>
-      <canvas id="chart" height="210" aria-label="AQI history and 24-hour forecast"></canvas>` : `<div class="meta">No forecast run yet for this location.</div>`}
+    <div class="chartwrap"><canvas id="chart" aria-label="AQI: last 3 days and next 24 hours"></canvas></div>
+    <div class="chart-key">
+      <span><i style="background:${css("--muted")}"></i>Observed</span>
+      <span><i style="background:${css("--accent")}"></i>Forecast</span>
+      <span><i style="background:${css("--band")};height:10px"></i>80% range</span>
+      <span>Background colour = CPCB category</span>
     </div>
-    ${forecast.length ? `<div class="card">
-      <h2>Pollutant outlook</h2>
-      <table><thead><tr><th></th><th>+6h</th><th>+12h</th><th>+24h</th></tr></thead><tbody>${rows}</tbody></table>
-      <div class="note">Hourly concentrations. AQI uses CPCB 24h means (PM, NO₂, SO₂) and 8h means (CO, O₃).</div>
-    </div>
-    <div class="card">
-      <h2>Ensemble members at +24h</h2>
-      <table><thead><tr><th>Model</th><th>AQI</th></tr></thead><tbody>
-        <tr><td>LSTM</td><td>${last.aqi_lstm ?? "—"}</td></tr>
-        <tr><td>GRU</td><td>${last.aqi_gru ?? "—"}</td></tr>
-        <tr><td>LightGBM</td><td>${last.aqi_lgbm ?? "—"}</td></tr>
-        <tr class="hl"><td>Blended ensemble</td><td>${last.aqi ?? "—"}</td></tr>
-      </tbody></table>
-      <div class="note">Model ${last.model_version || "—"} · issued ${fmtTime(last.forecast_generated_at)} IST</div>
-    </div>` : ""}`;
-  if (forecast.length) drawChart(history, forecast);
+    <div class="pols">${tiles}</div>
+    <div class="meta" style="margin-top:6px">Current values are CPCB averages (24h for PM, NO₂, SO₂; 8h for CO, O₃).</div>`;
+  drawChart(history, forecast);
+  const card = document.getElementById("about");
+  card.dataset.members = JSON.stringify({ lstm: last.aqi_lstm, gru: last.aqi_gru, lgbm: last.aqi_lgbm, aqi: last.aqi, v: last.model_version, t: last.forecast_generated_at });
+  if (card.open) renderSkill();
 }
+
+// Category colour bands behind the chart + "now" divider
+const bandsPlugin = {
+  id: "bands",
+  beforeDraw(c, _a, opts) {
+    const { ctx, chartArea: a, scales: { x, y } } = c;
+    if (!a) return;
+    ctx.save();
+    for (const [, v, lo, hi] of CATS) {
+      const top = y.getPixelForValue(Math.min(hi, y.max)), bot = y.getPixelForValue(Math.max(lo - 1, y.min));
+      if (bot <= a.top || top >= a.bottom || lo - 1 > y.max) continue;
+      ctx.fillStyle = css(v); ctx.globalAlpha = .09;
+      ctx.fillRect(a.left, Math.max(top, a.top), a.right - a.left, Math.min(bot, a.bottom) - Math.max(top, a.top));
+    }
+    ctx.globalAlpha = 1;
+    if (opts.now) {
+      const px = x.getPixelForValue(opts.now);
+      ctx.strokeStyle = css("--muted"); ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(px, a.top); ctx.lineTo(px, a.bottom); ctx.stroke();
+      ctx.setLineDash([]); ctx.fillStyle = css("--muted"); ctx.font = "11px Inter, sans-serif";
+      ctx.fillText("now", px + 4, a.top + 12);
+    }
+    ctx.restore();
+  },
+};
 
 function drawChart(history, forecast) {
   if (chart) chart.destroy();
   const ink = css("--muted"), line = css("--line"), acc = css("--accent");
   const pts = a => a.map(([x, y]) => ({ x: new Date(x).getTime(), y }));
+  const hist = history.slice(-72);
+  const now = new Date(forecast[0].forecast_generated_at).getTime();
+  const lastObs = hist.length ? [[hist[hist.length - 1].timestamp, hist[hist.length - 1].aqi]] : [];
+  const ymax = Math.max(...forecast.map(f => f.aqi_upper), ...hist.map(h => h.aqi));
   chart = new Chart(document.getElementById("chart"), {
     type: "line",
+    plugins: [bandsPlugin],
     data: { datasets: [
       { label: "Upper", data: pts(forecast.map(f => [f.forecast_target_time, f.aqi_upper])), borderWidth: 0, pointRadius: 0, fill: false },
-      { label: "80% interval", data: pts(forecast.map(f => [f.forecast_target_time, f.aqi_lower])), borderWidth: 0, pointRadius: 0, fill: "-1", backgroundColor: css("--band") },
-      { label: "Observed", data: pts(history.map(h => [h.timestamp, h.aqi])), borderColor: ink, borderWidth: 1.6, pointRadius: 0, tension: .25 },
-      { label: "Forecast", data: pts(forecast.map(f => [f.forecast_target_time, f.aqi])), borderColor: acc, borderWidth: 2.4, pointRadius: 0, tension: .25 },
+      { label: "80% range", data: pts(forecast.map(f => [f.forecast_target_time, f.aqi_lower])), borderWidth: 0, pointRadius: 0, fill: "-1", backgroundColor: css("--band") },
+      { label: "Observed", data: pts(hist.map(h => [h.timestamp, h.aqi])), borderColor: ink, borderWidth: 2, pointRadius: 0, tension: .25 },
+      { label: "Forecast", data: pts([...lastObs, ...forecast.map(f => [f.forecast_target_time, f.aqi])]), borderColor: acc, borderWidth: 3, pointRadius: 0, pointHoverRadius: 5, tension: .25 },
     ]},
     options: {
-      animation: false, parsing: false, interaction: { mode: "index", intersect: false },
+      maintainAspectRatio: false, animation: false, parsing: false, interaction: { mode: "nearest", axis: "x", intersect: false },
       plugins: {
-        legend: { labels: { color: ink, boxWidth: 12, filter: i => i.text !== "Upper" } },
-        tooltip: { callbacks: { title: i => fmtTime(i[0].parsed.x) + " IST" } },
+        bands: { now },
+        legend: { display: false },
+        tooltip: {
+          filter: i => i.dataset.label !== "Upper",
+          callbacks: {
+            title: i => fmtTime(i[0].parsed.x) + " IST",
+            label: i => i.dataset.label === "80% range"
+              ? ` 80% range: ${i.parsed.y}–${chart.data.datasets[0].data[i.dataIndex]?.y ?? "—"}`
+              : ` ${i.dataset.label}: ${i.parsed.y} (${aqiCat(i.parsed.y)})`,
+          },
+        },
       },
       scales: {
-        x: { type: "linear", ticks: { color: ink, maxTicksLimit: 6, callback: v => new Date(v).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", timeZone: "Asia/Kolkata" }) }, grid: { color: line } },
-        y: { beginAtZero: true, ticks: { color: ink }, grid: { color: line }, title: { display: true, text: "CPCB AQI", color: ink } },
+        x: { type: "linear", min: pts(hist.length ? [[hist[0].timestamp, 0]] : [[forecast[0].forecast_generated_at, 0]])[0].x, max: new Date(forecast[forecast.length - 1].forecast_target_time).getTime(), ticks: { color: ink, maxTicksLimit: 8, callback: v => new Date(v).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "numeric", ...IST }) }, grid: { color: line } },
+        y: { beginAtZero: true, suggestedMax: Math.ceil((ymax + 20) / 50) * 50, ticks: { color: ink }, grid: { color: line }, title: { display: true, text: "AQI", color: ink } },
       },
     },
   });
 }
 
-async function loadSkill() {
+// ---------- "About the model" (collapsed by default) ----------
+let skillData = null;
+document.getElementById("about").addEventListener("toggle", e => { if (e.target.open) renderSkill(); });
+async function renderSkill() {
   const el = document.getElementById("skill");
-  let s;
-  try { s = await api("/api/skill"); } catch { el.querySelector(".meta").textContent = "Unavailable."; return; }
-  const m = s?.test?.models;
-  if (!m) { el.querySelector(".meta").textContent = "No trained model registered yet."; return; }
-  const order = [["persistence", "Persistence (baseline)"], ["seasonal_naive", "Same hour yesterday"], ["lstm", "LSTM"], ["gru", "GRU"], ["lgbm", "LightGBM"], ["ensemble", "Ensemble"]];
-  const live = (s.live_by_horizon || []);
-  const liveMae = live.length ? live.reduce((a, r) => a + r.aqi_mae * r.n, 0) / live.reduce((a, r) => a + r.n, 0) : null;
-  const livePer = live.length ? live.reduce((a, r) => a + r.persistence_aqi_mae * r.n, 0) / live.reduce((a, r) => a + r.n, 0) : null;
-  el.innerHTML = `<h2>Model performance</h2>
-    <table><thead><tr><th>Held-out test</th><th>AQI MAE</th><th>Category hit</th><th>Skill</th></tr></thead><tbody>
+  if (!skillData) {
+    try { skillData = await api("/api/skill"); } catch { el.textContent = "Unavailable."; return; }
+  }
+  const s = skillData, m = s?.test?.models;
+  if (!m) { el.textContent = "No trained model registered yet."; return; }
+  const order = [["persistence", "Persistence (baseline)"], ["seasonal_naive", "Same hour yesterday"], ["lstm", "LSTM"], ["gru", "GRU"], ["lgbm", "LightGBM"], ["ensemble", "Ensemble (used)"]];
+  const live = s.live_by_horizon || [];
+  const tot = live.reduce((a, r) => a + r.n, 0);
+  const liveMae = tot ? live.reduce((a, r) => a + r.aqi_mae * r.n, 0) / tot : null;
+  const livePer = tot ? live.reduce((a, r) => a + r.persistence_aqi_mae * r.n, 0) / tot : null;
+  const mem = JSON.parse(document.getElementById("about").dataset.members || "{}");
+  el.innerHTML = `
+    <p style="margin:0 0 10px">An LSTM + GRU + LightGBM ensemble forecasts all six pollutants hour by hour using the last 7 days and the next 24 hours of weather. AQI is then computed with CPCB rules.</p>
+    <table><thead><tr><th>Held-out test</th><th>AQI error</th><th>Right category</th><th>Better than baseline</th></tr></thead><tbody>
     ${order.filter(([k]) => m[k]).map(([k, label]) => `<tr class="${k === "ensemble" ? "hl" : ""}"><td>${label}</td>
-      <td>${m[k].aqi_mae.toFixed(1)}</td><td>${(m[k].aqi_category_accuracy * 100).toFixed(1)}%</td>
+      <td>${m[k].aqi_mae.toFixed(1)}</td><td>${(m[k].aqi_category_accuracy * 100).toFixed(0)}%</td>
       <td>${k === "persistence" ? "—" : (m[k].aqi_skill_vs_persistence * 100).toFixed(0) + "%"}</td></tr>`).join("")}
     </tbody></table>
-    <div class="note">Test window ${s.data?.test_period?.map(t => t.slice(0, 10)).join(" → ") || ""} · ${s.test?.n_samples?.toLocaleString() || ""} forecasts at ${s.data?.nodes || ""} nodes, every horizon 1–24h.
-    Skill = MAE reduction vs persistence.${s.test?.interval_80_coverage_aqi ? ` 80% interval coverage: ${(s.test.interval_80_coverage_aqi * 100).toFixed(0)}%.` : ""}</div>
-    ${liveMae != null ? `<div class="note"><b>Live (last 7 days):</b> AQI MAE ${liveMae.toFixed(1)} vs persistence ${livePer.toFixed(1)}.</div>` : ""}`;
+    ${mem.aqi != null ? `<table><thead><tr><th>This location, +24h</th><th>LSTM</th><th>GRU</th><th>LightGBM</th><th>Ensemble</th></tr></thead>
+      <tbody><tr class="hl"><td>AQI</td><td>${mem.lstm ?? "—"}</td><td>${mem.gru ?? "—"}</td><td>${mem.lgbm ?? "—"}</td><td>${mem.aqi}</td></tr></tbody></table>` : ""}
+    <div>Test period ${s.data?.test_period?.map(t => t.slice(0, 10)).join(" → ") || "—"}${s.test?.interval_80_coverage_aqi ? ` · 80% range held the true AQI ${(s.test.interval_80_coverage_aqi * 100).toFixed(0)}% of the time` : ""}${liveMae != null ? ` · live error (7 days): ${liveMae.toFixed(1)} vs baseline ${livePer.toFixed(1)}` : ""}.</div>
+    <div style="margin-top:6px">Model ${esc(mem.v || s.model_version || "—")} · Data: Open-Meteo weather, Copernicus CAMS air quality.</div>`;
 }
 
-// Search over node names / states
+// ---------- search: places, forecast points, coordinates ----------
 const q = document.getElementById("q"), results = document.getElementById("results");
-q.addEventListener("input", () => {
-  const t = q.value.trim().toLowerCase();
-  if (!t) { results.style.display = "none"; return; }
-  const hits = nodes.filter(n => n.name.toLowerCase().includes(t) || (n.state || "").toLowerCase().includes(t))
-    .sort((a, b) => (a.kind === "city" ? 0 : 1) - (b.kind === "city" ? 0 : 1) || a.name.localeCompare(b.name)).slice(0, 12);
-  results.innerHTML = hits.map(n => `<li data-h="${n.h}"><span>${n.name}</span><span style="color:${aqiColor(n.aqi)};font-weight:700">${n.aqi}</span></li>`).join("")
-    || `<li style="color:var(--muted)">No match</li>`;
+let items = [], active = -1, geoTimer = null, geoSeq = 0;
+
+function parseCoords(t) {
+  const m = t.replace(/°/g, "").match(/^\s*(-?\d{1,2}(?:\.\d+)?)\s*[nN]?\s*[,\s]\s*(-?\d{2,3}(?:\.\d+)?)\s*[eE]?\s*$/);
+  if (!m) return null;
+  const lat = +m[1], lon = +m[2];
+  return lat >= 6 && lat <= 38 && lon >= 68 && lon <= 98 ? { lat, lon } : { lat, lon, outside: true };
+}
+
+function renderResults(local, places, coords) {
+  items = []; let html = "";
+  if (coords) {
+    if (coords.outside) html += `<li class="grp">Coordinates outside India</li>`;
+    else {
+      items.push({ lat: coords.lat, lon: coords.lon, label: `${coords.lat.toFixed(3)}, ${coords.lon.toFixed(3)}` });
+      html += `<li data-i="0"><span>📍 Go to ${coords.lat.toFixed(3)}°N, ${coords.lon.toFixed(3)}°E</span></li>`;
+    }
+  }
+  if (places.length) {
+    html += `<li class="grp">Places</li>`;
+    for (const p of places) {
+      items.push({ lat: p.latitude, lon: p.longitude, label: p.name });
+      html += `<li data-i="${items.length - 1}"><span>${esc(p.name)}</span><small>${esc([p.admin2, p.admin1].filter(Boolean).join(", "))}</small></li>`;
+    }
+  }
+  if (local.length) {
+    html += `<li class="grp">Forecast points</li>`;
+    for (const n of local) {
+      items.push({ h: n.h });
+      html += `<li data-i="${items.length - 1}"><span>${esc(n.name)} <small>${esc(n.state || "")}</small></span><b style="color:${aqiColor(n.aqi)}">${n.aqi}</b></li>`;
+    }
+  }
+  results.innerHTML = html || `<li class="grp">No match</li>`;
   results.style.display = "block";
+  active = -1;
+}
+
+q.addEventListener("input", () => {
+  const t = q.value.trim();
+  clearTimeout(geoTimer);
+  if (!t) { results.style.display = "none"; return; }
+  const coords = parseCoords(t);
+  const lt = t.toLowerCase();
+  const local = coords ? [] : nodes.filter(n => n.name.toLowerCase().includes(lt) || (n.state || "").toLowerCase().includes(lt))
+    .sort((a, b) => (a.kind === "city" ? 0 : 1) - (b.kind === "city" ? 0 : 1) || a.name.localeCompare(b.name)).slice(0, 6);
+  renderResults(local, [], coords);
+  if (coords || t.length < 2) return;
+  const seq = ++geoSeq;
+  geoTimer = setTimeout(async () => {
+    const places = await geocode(t);
+    if (seq === geoSeq && q.value.trim() === t && places.length) renderResults(local, places, null);
+  }, 250);
 });
-results.addEventListener("click", e => {
-  const li = e.target.closest("li[data-h]"); if (!li) return;
-  results.style.display = "none"; q.value = ""; select(li.dataset.h);
+
+function choose(i) {
+  const it = items[i]; if (!it) return;
+  results.style.display = "none"; q.blur();
+  if (it.h) { clearPin(); q.value = ""; setUrl({}); select(it.h); }
+  else { q.value = it.label; goTo(it.lat, it.lon, it.label); }
+}
+results.addEventListener("click", e => { const li = e.target.closest("li[data-i]"); if (li) choose(+li.dataset.i); });
+q.addEventListener("keydown", e => {
+  const lis = [...results.querySelectorAll("li[data-i]")];
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault(); if (!lis.length) return;
+    active = (active + (e.key === "ArrowDown" ? 1 : -1) + lis.length) % lis.length;
+    lis.forEach((li, k) => li.classList.toggle("active", k === active));
+  } else if (e.key === "Enter") {
+    const pick = active >= 0 ? lis[active] : lis[0];
+    if (pick) choose(+pick.dataset.i);
+  } else if (e.key === "Escape") results.style.display = "none";
 });
-document.addEventListener("click", e => { if (!e.target.closest(".search")) results.style.display = "none"; });
+document.addEventListener("click", e => { if (!e.target.closest(".searchbar")) results.style.display = "none"; });
+
+document.getElementById("locate").addEventListener("click", () => {
+  if (!navigator.geolocation) return alert("Location is not available in this browser.");
+  navigator.geolocation.getCurrentPosition(
+    p => goTo(p.coords.latitude, p.coords.longitude, "My location"),
+    () => alert("Could not get your location (permission denied?)."),
+    { timeout: 10000 });
+});
 
 loadNodes().catch(() => document.getElementById("updated").textContent = "Could not load data.");
-loadSkill();
 </script>
 </body>
 </html>
