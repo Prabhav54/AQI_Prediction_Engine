@@ -46,7 +46,12 @@ def _normalise_url(url: str) -> str:
     # Neon / Heroku style URLs use the bare `postgres://` scheme
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
-    return url.replace("postgresql+asyncpg://", "postgresql://")
+    url = url.replace("postgresql+asyncpg://", "postgresql://")
+    # Pin the driver: SQLAlchemy 2.1 maps bare `postgresql://` to psycopg 3, but the
+    # bulk writes (execute_values) and setup_db (conn.notices) are psycopg2 APIs.
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg2://" + url[len("postgresql://"):]
+    return url
 
 
 def get_sync_engine():
